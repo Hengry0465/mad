@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "421456007136",
+    "project_id": "madexpenses-324a2",
+    "storage_bucket": "madexpenses-324a2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:421456007136:android:c8d805db671ba7eb9ae585",
+        "android_client_info": {
+          "package_name": "com.example.mad"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAn_4g2B0-xQBxfCryZ5JbPeUFNzioJ0Lc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
