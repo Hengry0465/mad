@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
+import 'package:mad/addTransaction.dart';
+import 'package:mad/overview.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,9 +36,19 @@ class TransactionHistoryScreen extends StatefulWidget {
 class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
   String _searchQuery = '';
   String _selectedFilter = 'All';
-  DateTimeRange? _dateRange;
   final List<String> _filters = ['All', 'Income', 'Expense'];
   int currentPageIndex = 2;
+
+  // Month/year dropdown variables
+  final List<String> _months = [
+    'January', 'February', 'March', 'April',
+    'May', 'June', 'July', 'August',
+    'September', 'October', 'November', 'December'
+  ];
+  final List<int> _years = List.generate(5, (index) => DateTime.now().year - index);
+  String? _selectedMonth;
+  int? _selectedYear;
+  DateTime? _selectedMonthYear;
 
   @override
   Widget build(BuildContext context) {
@@ -65,9 +77,7 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
             const SizedBox(height: 20),
             _buildSearchBar(),
             const SizedBox(height: 20),
-            _buildFilterTabs(),
-            const SizedBox(height: 20),
-            _buildDateRangeSelector(context),
+            _buildCombinedFilterRow(),
             const SizedBox(height: 20),
             Expanded(
               child: _buildTransactionList(),
@@ -75,25 +85,61 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
           ],
         ),
       ),
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: currentPageIndex,
-        onTap: (index) {
-          // Handle navigation based on index
-        },
-        items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.home),
-            label: 'Overview',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.add),
-            label: 'Add',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.history),
-            label: 'History',
-          ),
-        ],
+      bottomNavigationBar: Container(
+        color: Colors.white,
+        padding: const EdgeInsets.symmetric(vertical: 8.0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceAround,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.home),
+              onPressed: () {
+                Navigator.push(
+                  context, MaterialPageRoute(builder: (context) => const Overview()),
+                );
+              },
+              color: currentPageIndex == 0 ? Colors.amber : Colors.grey,
+            ),
+            IconButton(
+              icon: const Icon(Icons.add_outlined),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const AddTransaction()),
+                );
+              },
+              color: currentPageIndex == 1 ? Colors.amber : Colors.grey,
+            ),
+            IconButton(
+              icon: const Icon(Icons.wallet),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const History()),
+                );
+              },
+              color: currentPageIndex == 2 ? Colors.amber : Colors.grey,
+            ),
+            IconButton(
+              icon: const Icon(Icons.report),
+              onPressed: () {
+                setState(() {
+                  currentPageIndex = 3;
+                });
+              },
+              color: currentPageIndex == 3 ? Colors.amber : Colors.grey,
+            ),
+            IconButton(
+              icon: const Icon(Icons.settings),
+              onPressed: () {
+                setState(() {
+                  currentPageIndex = 4;
+                });
+              },
+              color: currentPageIndex == 4 ? Colors.amber : Colors.grey,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -122,56 +168,140 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
     );
   }
 
-  Widget _buildFilterTabs() {
-    return Row(
-      children: _filters.map((filter) {
-        return Padding(
-          padding: const EdgeInsets.only(right: 16.0),
-          child: ChoiceChip(
-            label: Text(filter),
-            selected: _selectedFilter == filter,
-            onSelected: (selected) => setState(() => _selectedFilter = filter),
-          ),
-        );
-      }).toList(),
-    );
-  }
+  Widget _buildCombinedFilterRow() {
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Row(
+          children: [
+            // Filter chips on the left
+            Expanded(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: _filters.map((filter) {
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8.0),
+                      child: ChoiceChip(
+                        label: Text(filter),
+                        selected: _selectedFilter == filter,
+                        onSelected: (selected) => setState(() => _selectedFilter = filter),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+            ),
 
-  Widget _buildDateRangeSelector(BuildContext context) {
-    return Row(
-      children: [
-        const Text(
-          'Date range',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            fontSize: 16,
-          ),
+            // Month/Year dropdowns on the right
+            Row(
+              children: [
+                // Month dropdown
+                Container(
+                  width: 100,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[200],
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: DropdownButton<String>(
+                    isExpanded: true,
+                    value: _selectedMonth,
+                    hint: const Text('Month', style: TextStyle(fontSize: 12)),
+                    underline: const SizedBox(),
+                    icon: const Icon(Icons.arrow_drop_down, size: 20),
+                    style: const TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                    ),
+                    items: _months.map((String month) {
+                      return DropdownMenuItem<String>(
+                        value: month,
+                        child: Text(month, style: const TextStyle(fontSize: 12)),
+                      );
+                    }).toList(),
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        _selectedMonth = newValue;
+                        if (_selectedMonth != null && _selectedYear != null) {
+                          _selectedMonthYear = DateTime(
+                              _selectedYear!,
+                              _months.indexOf(_selectedMonth!) + 1
+                          );
+                        }
+                      });
+                    },
+                  ),
+                ),
+                if (_selectedMonth != null)
+                  IconButton(
+                    icon: const Icon(Icons.clear, size: 16),
+                    onPressed: () {
+                      setState(() {
+                        _selectedMonth = null;
+                        _selectedMonthYear = null;
+                      });
+                    },
+                  ),
+
+                const SizedBox(width: 8),
+
+                // Year dropdown
+                Container(
+                  width: 80,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[200],
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: DropdownButton<int>(
+                    isExpanded: true,
+                    value: _selectedYear,
+                    hint: const Text('Year', style: TextStyle(fontSize: 12)),
+                    underline: const SizedBox(),
+                    icon: const Icon(Icons.arrow_drop_down, size: 20),
+                    style: const TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                    ),
+                    items: _years.map((int year) {
+                      return DropdownMenuItem<int>(
+                        value: year,
+                        child: Text(year.toString(), style: const TextStyle(fontSize: 12)),
+                      );
+                    }).toList(),
+                    onChanged: (int? newValue) {
+                      setState(() {
+                        _selectedYear = newValue;
+                        if (_selectedMonth != null && _selectedYear != null) {
+                          _selectedMonthYear = DateTime(
+                              _selectedYear!,
+                              _months.indexOf(_selectedMonth!) + 1
+                          );
+                        }
+                      });
+                    },
+                  ),
+                ),
+                if (_selectedYear != null)
+                  IconButton(
+                    icon: const Icon(Icons.clear, size: 16),
+                    onPressed: () {
+                      setState(() {
+                        _selectedYear = null;
+                        _selectedMonthYear = null;
+                      });
+                    },
+                  ),
+              ],
+            ),
+          ],
         ),
-        const Spacer(),
-        IconButton(
-          icon: const Icon(Icons.calendar_today, size: 20),
-          onPressed: () async {
-            final picked = await showDateRangePicker(
-              context: context,
-              firstDate: DateTime(2020),
-              lastDate: DateTime.now(),
-            );
-            if (picked != null) {
-              setState(() => _dateRange = picked);
-            }
-          },
-        ),
-        const SizedBox(width: 8),
-        Text(
-          _dateRange == null
-              ? 'Select range'
-              : '${DateFormat('MMM d').format(_dateRange!.start)} - '
-              '${DateFormat('MMM d').format(_dateRange!.end)}',
-          style: const TextStyle(
-            color: Colors.black,
-          ),
-        ),
-      ],
+      ),
     );
   }
 
@@ -207,7 +337,7 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
             date = DateTime.now();
           }
 
-          // Search filter - matches if search query is empty or title contains query
+          // Search filter
           final matchesSearch = _searchQuery.isEmpty ||
               title.contains(_searchQuery.toLowerCase());
 
@@ -216,65 +346,129 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen> {
               (_selectedFilter == 'Income' && !isExpense) ||
               (_selectedFilter == 'Expense' && isExpense);
 
-          // Date filter
-          final matchesDate = _dateRange == null ||
-              (date.isAfter(_dateRange!.start) &&
-                  date.isBefore(_dateRange!.end));
+          // Month filter
+          final matchesMonth = _selectedMonthYear == null ||
+              (date.year == _selectedMonthYear!.year &&
+                  date.month == _selectedMonthYear!.month);
 
-          return matchesSearch && matchesType && matchesDate;
+          return matchesSearch && matchesType && matchesMonth;
         }).toList();
 
         if (transactions.isEmpty) {
           return Center(
-            child: Text(
-              _searchQuery.isEmpty
-                  ? 'No transactions match your filters'
-                  : 'No transactions found for "$_searchQuery"',
-              style: const TextStyle(fontSize: 16),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _searchQuery.isEmpty
+                      ? 'No transactions in ${_selectedMonthYear != null ? DateFormat('MMMM yyyy').format(_selectedMonthYear!) : 'selected month'}'
+                      : 'No transactions found for "$_searchQuery"',
+                  style: const TextStyle(fontSize: 16),
+                ),
+              ],
             ),
           );
         }
 
-        return ListView.builder(
-          itemCount: transactions.length,
-          itemBuilder: (context, index) {
-            final transaction = transactions[index];
-            final data = transaction.data() as Map<String, dynamic>;
-            final title = data['title']?.toString() ?? 'No Title';
-            final isExpense = data['isExpense'] ?? true;
-            final amount = (data['amount'] ?? 0.0).toDouble();
-            final category = data['category']?.toString() ?? 'No Category';
-
-            // Handle date formats
-            DateTime transactionDate;
-            if (data['date'] is Timestamp) {
-              transactionDate = (data['date'] as Timestamp).toDate();
-            } else if (data['date'] is String) {
-              transactionDate = DateTime.tryParse(data['date']) ?? DateTime.now();
-            } else {
-              transactionDate = DateTime.now();
-            }
-
-            final formattedDate = DateFormat('yyyy-MM-dd').format(transactionDate);
-
-            return Card(
-              margin: const EdgeInsets.only(bottom: 8),
-              child: ListTile(
-                title: Text(title),
-                subtitle: Text('$category • $formattedDate'),
-                trailing: Text(
-                  'RM ${amount.toStringAsFixed(2)}',
+        return Column(
+          children: [
+            if (_selectedMonthYear != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  'Showing transactions for ${DateFormat('MMMM yyyy').format(_selectedMonthYear!)}',
                   style: TextStyle(
-                    color: isExpense ? Colors.red : Colors.green,
+                    color: Colors.grey[600],
+                    fontStyle: FontStyle.italic,
                   ),
                 ),
-                leading: Icon(
-                  isExpense ? Icons.arrow_downward : Icons.arrow_upward,
-                  color: isExpense ? Colors.red : Colors.green,
-                ),
               ),
-            );
-          },
+            Expanded(
+              child: ListView.builder(
+                physics: const AlwaysScrollableScrollPhysics(),
+                itemCount: transactions.length,
+                itemBuilder: (context, index) {
+                  final transaction = transactions[index];
+                  final data = transaction.data() as Map<String, dynamic>;
+                  final docId = transaction.id;
+                  final title = data['title']?.toString() ?? 'No Title';
+                  final isExpense = data['isExpense'] ?? true;
+                  final amount = (data['amount'] ?? 0.0).toDouble();
+                  final category = data['category']?.toString() ?? 'No Category';
+
+                  // Handle date formats
+                  DateTime transactionDate;
+                  if (data['date'] is Timestamp) {
+                    transactionDate = (data['date'] as Timestamp).toDate();
+                  } else if (data['date'] is String) {
+                    transactionDate = DateTime.tryParse(data['date']) ?? DateTime.now();
+                  } else {
+                    transactionDate = DateTime.now();
+                  }
+
+                  final formattedDate = DateFormat('MMM d, yyyy').format(transactionDate);
+
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      title: Text(title),
+                      subtitle: Text('$category • $formattedDate'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'RM ${amount.toStringAsFixed(2)}',
+                            style: TextStyle(
+                              color: isExpense ? Colors.red : Colors.green,
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete, size: 20, color: Colors.red),
+                            onPressed: () => _deleteTransaction(docId),
+                          ),
+                        ],
+                      ),
+                      leading: Icon(
+                        isExpense ? Icons.arrow_downward : Icons.arrow_upward,
+                        color: isExpense ? Colors.red : Colors.green,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _deleteTransaction(String docId) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Delete Transaction'),
+          content: const Text('Are you sure you want to delete this transaction?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                FirebaseFirestore.instance
+                    .collection('transactions')
+                    .doc(docId)
+                    .delete();
+                Navigator.of(context).pop();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Transaction deleted')),
+                );
+              },
+              child: const Text('Delete', style: TextStyle(color: Colors.red)),
+            ),
+          ],
         );
       },
     );

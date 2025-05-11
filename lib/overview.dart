@@ -330,7 +330,7 @@ class _MyHomePageState extends State<MyHomePage> {
               color: currentPageIndex == 1 ? Colors.amber : Colors.grey,
             ),
             IconButton(
-              icon: const Icon(Icons.add_outlined),
+              icon: const Icon(Icons.wallet),
               onPressed: () {
                 Navigator.push(
                   context,

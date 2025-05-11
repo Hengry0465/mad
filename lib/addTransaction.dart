@@ -125,7 +125,7 @@ class _addTransaction extends State<addTransaction> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Add Transaction'),
-        backgroundColor: Colors.amber,
+        backgroundColor: Colors.yellow,
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
@@ -280,7 +280,7 @@ class _addTransaction extends State<addTransaction> {
               color: currentPageIndex == 1 ? Colors.amber : Colors.grey,
             ),
             IconButton(
-              icon: const Icon(Icons.add_outlined),
+              icon: const Icon(Icons.wallet),
               onPressed: () {
                 Navigator.push(
                   context,
