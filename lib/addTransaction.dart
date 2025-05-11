@@ -3,6 +3,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:async';
 import 'package:intl/intl.dart';
+import 'package:mad/history.dart';
+import 'package:mad/overview.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,7 +21,7 @@ class AddTransaction extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'AddTransaction',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.amber),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.yellow),
       ),
       home: addTransaction(title: 'AddTransaction'),
     );
@@ -40,7 +42,7 @@ class _addTransaction extends State<addTransaction> {
   final TextEditingController _amountController = TextEditingController();
   final TextEditingController _descriptionController = TextEditingController();
   String _selectedCategory = "";
-  int currentPageIndex = 0;
+  int currentPageIndex = 1;
   DateTime? _selectedDate = DateTime.now(); // Set the default date to current date
 
   final List<String> expenseCategories = [
@@ -249,51 +251,9 @@ class _addTransaction extends State<addTransaction> {
             child: Text(isExpense ? "Add Expense" : "Add Income"),
           ),
           const SizedBox(height: 20),
-          const Text('Recent Transactions:', style: TextStyle(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 10),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection('transactions')
-                  .orderBy('date', descending: true)
-                  .snapshots(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                if (snapshot.hasError) {
-                  return const Center(child: Text('Error fetching transactions.'));
-                }
-                if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                  return const Center(child: Text('No transactions recorded.'));
-                }
-                final transactions = snapshot.data!.docs;
-                return ListView.builder(
-                  itemCount: transactions.length,
-                  itemBuilder: (context, index) {
-                    var transaction = transactions[index];
-                    var timestamp = transaction['date'];
-
-                    // Convert 'date' to a readable format
-                    DateTime transactionDate = timestamp is Timestamp ? timestamp.toDate() : DateTime.parse(timestamp);
-                    String formattedDate = DateFormat('yyyy-MM-dd').format(transactionDate);
-
-                    return ListTile(
-                      title: Text(transaction['title']),
-                      subtitle: Text('${transaction['category']} - $formattedDate'),
-                      trailing: Text('RM ${transaction['amount']}'),
-                      leading: Icon(
-                        transaction['isExpense'] ? Icons.remove_circle : Icons.add_circle,
-                        color: transaction['isExpense'] ? Colors.red : Colors.green,
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          )
         ]),
       ),
+
       bottomNavigationBar: Container(
         color: Colors.white,
         padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -302,7 +262,11 @@ class _addTransaction extends State<addTransaction> {
           children: [
             IconButton(
               icon: const Icon(Icons.home),
-              onPressed: () {},
+              onPressed: () {
+                Navigator.push(
+                  context, MaterialPageRoute(builder: (context) => const Overview()),
+                );
+              },
               color: currentPageIndex == 0 ? Colors.amber : Colors.grey,
             ),
             IconButton(
@@ -316,11 +280,12 @@ class _addTransaction extends State<addTransaction> {
               color: currentPageIndex == 1 ? Colors.amber : Colors.grey,
             ),
             IconButton(
-              icon: const Icon(Icons.wallet),
+              icon: const Icon(Icons.add_outlined),
               onPressed: () {
-                setState(() {
-                  currentPageIndex = 2;
-                });
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const History()),
+                );
               },
               color: currentPageIndex == 2 ? Colors.amber : Colors.grey,
             ),
