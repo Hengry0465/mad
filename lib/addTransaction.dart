@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:mad/main.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 void main() {
   runApp(const AddTransaction());
@@ -9,7 +11,6 @@ void main() {
 class AddTransaction extends StatelessWidget {
   const AddTransaction({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -36,12 +37,12 @@ class addTransaction extends StatefulWidget {
 }
 
 class _addTransaction extends State<addTransaction> {
-  bool isExpense = true;
   final TextEditingController _titleController = TextEditingController();
   final TextEditingController _amountController = TextEditingController();
   final TextEditingController _descriptionController = TextEditingController();
+  bool isExpense = true;
   String _selectedCategory = "";
-  DateTime _selectedDate = DateTime.now();
+  DateTime _selectedDate = DateTime.now(); // Automatically set to current date
   int currentPageIndex = 0;
 
   final List<Map<String, dynamic>> _transactions = [];
@@ -75,21 +76,8 @@ class _addTransaction extends State<addTransaction> {
     var obj = _addTransaction; // Calls the default constructor
   }
 
-  // Function to pick a date
-  Future<void> _selectDate(BuildContext context) async {
-    final DateTime? picked = await showDatePicker(
-        context: context,
-        initialDate: _selectedDate,
-        firstDate: DateTime(2015, 8),
-        lastDate: DateTime(2101));
-    if (picked != null && picked != _selectedDate) {
-      setState(() {
-        _selectedDate = picked;
-      });
-    }
-  }
-
-  void addTransaction() {
+  // Function to add a transaction
+  void addTransaction() async {
     String title = _titleController.text.trim();
     String amountText = _amountController.text.trim();
     String description = _descriptionController.text.trim();
@@ -116,40 +104,43 @@ class _addTransaction extends State<addTransaction> {
       return;
     }
 
-    // Add transaction to the simulated database
-    _transactions.add({
-      'title': title,
-      'amount': amount,
-      'category': category,
-      'description': description.isNotEmpty ? description : "No description",
-      'date': _selectedDate,
-      'type': isExpense ? "Expense" : "Income",
-    });
+    // Automatically set the current date
+    _selectedDate = DateTime.now();
 
-    // Sort the transactions by date (latest first)
-    _transactions.sort((a, b) => b['date'].compareTo(a['date']));
+    // ✅ Save to Firestore
+    try {
+      await FirebaseFirestore.instance.collection('transactions').add({
+        'title': title,
+        'amount': amount,
+        'category': category,
+        'description': description.isNotEmpty ? description : "No description",
+        'date': _selectedDate,
+        'type': isExpense ? "Expense" : "Income",
+        'userId': FirebaseAuth.instance.currentUser?.uid ?? 'anonymous',
+      });
 
-    print("Transactions Database: $_transactions");
+      // Clear form
+      _titleController.clear();
+      _amountController.clear();
+      _descriptionController.clear();
 
-    // Clear form fields after adding
-    _titleController.clear();
-    _amountController.clear();
-    _descriptionController.clear();
-    setState(() {
-      _selectedCategory = isExpense ? expenseCategories.first : incomeCategories.first;
-      _selectedDate = DateTime.now();
-    });
+      setState(() {
+        _selectedCategory = isExpense ? expenseCategories.first : incomeCategories.first;
+        _selectedDate = _selectedDate;
+      });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('$title added successfully!'),
-      ),
-    );
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$title added successfully!')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error adding transaction: $e')),
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Add Transaction'),
@@ -223,6 +214,10 @@ class _addTransaction extends State<addTransaction> {
                 ),
                 const SizedBox(height: 8),
 
+                // Automatically Display the current date
+                Text("${_selectedDate.toLocal()}".split(' ')[0]),
+                const SizedBox(height: 10),
+
                 // Title Field
                 TextField(
                   controller: _titleController,
@@ -231,7 +226,7 @@ class _addTransaction extends State<addTransaction> {
                     border: OutlineInputBorder(),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
 
                 // Amount Field
                 TextField(
@@ -243,7 +238,7 @@ class _addTransaction extends State<addTransaction> {
                     border: OutlineInputBorder(),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
 
                 // Category Dropdown
                 DropdownButtonFormField<String>(
@@ -265,7 +260,7 @@ class _addTransaction extends State<addTransaction> {
                     border: OutlineInputBorder(),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
 
                 // Description Field (Optional)
                 TextField(
@@ -276,14 +271,7 @@ class _addTransaction extends State<addTransaction> {
                   ),
                   maxLines: 2,
                 ),
-
-                // Date Picker
-                Text("${_selectedDate.toLocal()}".split(' ')[0]),
-                ElevatedButton(
-                  onPressed: () => _selectDate(context),
-                  child: const Text('Select date'),
-                ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
 
                 // Add Transaction Button
                 ElevatedButton(
@@ -293,8 +281,42 @@ class _addTransaction extends State<addTransaction> {
                   ),
                   child: Text(isExpense ? "Add Expense" : "Add Income"),
                 ),
-              ])
+                const SizedBox(height: 10),
+                Expanded(
+                    child: StreamBuilder<QuerySnapshot>(
+                        stream: FirebaseFirestore.instance
+                            .collection('transactions')
+                            .where('userId', isEqualTo: FirebaseAuth.instance.currentUser?.uid ?? 'anonymous')
+                            .orderBy('date', descending: true)
+                            .snapshots(),
+                        builder: (context, snapshot){
+                          if (snapshot.connectionState == ConnectionState.waiting) {
+                            return const Center(child: CircularProgressIndicator());
+                          }
+                          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                            return const Center(child: Text('No transactions yet.'));
+                          }
+                          final transactions = snapshot.data!.docs;
+
+                          return ListView.builder(
+                            itemCount: transactions.length,
+                            itemBuilder: (context, index){
+                              final data = transactions[index].data() as Map<String, dynamic>;
+                              return ListTile(
+                                leading: Icon(data['type'] == 'Expense' ? Icons.remove_circle : Icons.add_circle,
+                                    color: data['type'] == 'Expense' ? Colors.red : Colors.green),
+                                title: Text(data['title']),
+                                subtitle: Text('${data['category']} • ${data['description']}'),
+                                trailing: Text('RM ${data['amount'].toString()}'),
+                              );
+                            }
+                          );
+                        }
+                    ))
+              ]),
       ),
+
+
       bottomNavigationBar: Container(
         color: Colors.white,
         padding: const EdgeInsets.symmetric(vertical: 8.0),
