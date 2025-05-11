@@ -183,61 +183,91 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
                 const SizedBox(height: 16),
 
+                // In the Card widget for Budget (replace the existing Card widget)
                 Card(
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                   child: Padding(
                     padding: const EdgeInsets.all(16.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    child: Column(
                       children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            const Text("Budget", style: TextStyle(color: Colors.grey)),
-                            const SizedBox(height: 8),
-                            Text(
-                              formatCurrency(_budgetTotal),
-                              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text("Budget", style: TextStyle(color: Colors.grey)),
+                                const SizedBox(height: 8),
+                                Text(
+                                  formatCurrency(_budgetTotal),
+                                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.edit, color: Colors.blue),
+                              onPressed: () {
+                                showDialog(
+                                  context: context,
+                                  builder: (context) => AlertDialog(
+                                    title: const Text('Set Budget'),
+                                    content: TextField(
+                                      controller: _budgetController,
+                                      keyboardType: TextInputType.number,
+                                      decoration: const InputDecoration(
+                                        labelText: 'Enter Budget',
+                                        prefixText: 'RM ',
+                                      ),
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.pop(context),
+                                        child: const Text('Cancel'),
+                                      ),
+                                      TextButton(
+                                        onPressed: () {
+                                          if (_budgetController.text.isNotEmpty &&
+                                              RegExp(r'^\d+(\.\d+)?$').hasMatch(_budgetController.text)) {
+                                            saveBudget(double.parse(_budgetController.text));
+                                            Navigator.pop(context);
+                                          } else {
+                                            ScaffoldMessenger.of(context).showSnackBar(
+                                              const SnackBar(content: Text('Please enter a valid amount')),
+                                            );
+                                          }
+                                        },
+                                        child: const Text('Save'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
                             ),
                           ],
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.edit, color: Colors.blue),
-                          onPressed: () {
-                            showDialog(
-                              context: context,
-                              builder: (context) => AlertDialog(
-                                title: const Text('Set Budget'),
-                                content: TextField(
-                                  controller: _budgetController,
-                                  keyboardType: TextInputType.number,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Enter Budget',
-                                    prefixText: 'RM ',
-                                  ),
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () => Navigator.pop(context),
-                                    child: const Text('Cancel'),
-                                  ),
-                                  TextButton(
-                                    onPressed: () {
-                                      if (_budgetController.text.isNotEmpty &&
-                                          RegExp(r'^\d+(\.\d+)?$').hasMatch(_budgetController.text)) {
-                                        saveBudget(double.parse(_budgetController.text));
-                                        Navigator.pop(context);
-                                      } else {
-                                        ScaffoldMessenger.of(context).showSnackBar(
-                                          const SnackBar(content: Text('Please enter a valid amount')),
-                                        );
-                                      }
-                                    },
-                                    child: const Text('Save'),
-                                  ),
-                                ],
-                              ),
-                            );
+                        const SizedBox(height: 8),
+                        // Add budget status indicator
+                        Builder(
+                          builder: (context) {
+                            double currentBalance = _incomeTotal - _expenseTotal;
+                            double budgetDifference = _budgetTotal - currentBalance;
+
+                            if (_budgetTotal == 0) {
+                              return const Text(
+                                "No budget set",
+                                style: TextStyle(color: Colors.grey),
+                              );
+                            } else if (budgetDifference >= 0) {
+                              return Text(
+                                "You have RM${budgetDifference.toStringAsFixed(2)} remaining",
+                                style: const TextStyle(color: Colors.green),
+                              );
+                            } else {
+                              return Text(
+                                "You exceeded budget by RM${(-budgetDifference).toStringAsFixed(2)}",
+                                style: const TextStyle(color: Colors.red),
+                              );
+                            }
                           },
                         ),
                       ],

@@ -125,7 +125,7 @@ class _addTransaction extends State<addTransaction> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Add Transaction'),
-        backgroundColor: Colors.yellow,
+        backgroundColor: Colors.amber,
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
