@@ -3,6 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'forgot_password_screen.dart';
 import 'profile_screen.dart';
 import 'register_screen.dart';
+import 'package:mad/overview.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({Key? key}) : super(key: key);
@@ -40,7 +41,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
       if (mounted) {
         Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (context) => const ProfileScreen()),
+          MaterialPageRoute(builder: (context) => const MainNavigationScreen()),
               (route) => false,
         );
       }

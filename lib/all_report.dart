@@ -1,6 +1,7 @@
 // allreport.dart
 import 'package:flutter/material.dart';
 import 'report_page.dart';
+import 'reportpage.dart';
 
 class AllReportPage extends StatefulWidget {
   const AllReportPage({Key? key}) : super(key: key);
@@ -67,50 +68,11 @@ class _AllReportPageState extends State<AllReportPage> with SingleTickerProvider
       body: TabBarView(
         controller: _tabController,
         children: [
-          // 未实现的 Transaction Report 的占位符
-          Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  Icons.bar_chart,
-                  size: 80,
-                  color: Colors.grey[300],
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Transaction Report',
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.grey[700],
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Coming soon...',
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Colors.grey[500],
-                  ),
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed: () {},
-                  icon: const Icon(Icons.notifications),
-                  label: const Text('Notify me when available'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.amber,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                  ),
-                ),
-              ],
-            ),
-          ),
+
 
           // 已实现的 Dept Report
           const ReportPage(),
+          const DeptReportPage(),
         ],
       ),
     );

@@ -7,14 +7,14 @@ import 'package:flutter/services.dart';
 import 'dept_model.dart';
 import 'dept_service.dart';
 
-class ReportPage extends StatefulWidget {
-  const ReportPage({Key? key}) : super(key: key);
+class DeptReportPage extends StatefulWidget {
+  const DeptReportPage({Key? key}) : super(key: key);
 
   @override
   _ReportPageState createState() => _ReportPageState();
 }
 
-class _ReportPageState extends State<ReportPage> {
+class _ReportPageState extends State<DeptReportPage> {
   final DeptService _deptService = DeptService();
 
   // Initialize with default values immediately

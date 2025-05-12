@@ -11,6 +11,7 @@ import 'dept_service.dart';
 import 'permission_dialog.dart';
 import 'notification_service.dart';
 import 'report_page.dart';
+import 'upload.dart';
 
 // 主导航控制器
 class MainNavigationScreen extends StatefulWidget {
@@ -254,7 +255,9 @@ class _MyHomePageState extends State<MyHomePage> {
                         IconButton(
                           icon: const Icon(Icons.cloud_upload, color: Colors.blue),
                           onPressed: () {
-                            // 导航到上传页面的占位
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (context) => const UploadPage()),);
                           },
                         ),
                         // 个人资料按钮
