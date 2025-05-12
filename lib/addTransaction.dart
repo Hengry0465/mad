@@ -253,63 +253,6 @@ class _addTransaction extends State<addTransaction> {
           const SizedBox(height: 20),
         ]),
       ),
-
-      bottomNavigationBar: Container(
-        color: Colors.white,
-        padding: const EdgeInsets.symmetric(vertical: 8.0),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            IconButton(
-              icon: const Icon(Icons.home),
-              onPressed: () {
-                Navigator.push(
-                  context, MaterialPageRoute(builder: (context) => const Overview()),
-                );
-              },
-              color: currentPageIndex == 0 ? Colors.amber : Colors.grey,
-            ),
-            IconButton(
-              icon: const Icon(Icons.add_outlined),
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const AddTransaction()),
-                );
-              },
-              color: currentPageIndex == 1 ? Colors.amber : Colors.grey,
-            ),
-            IconButton(
-              icon: const Icon(Icons.wallet),
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const History()),
-                );
-              },
-              color: currentPageIndex == 2 ? Colors.amber : Colors.grey,
-            ),
-            IconButton(
-              icon: const Icon(Icons.report),
-              onPressed: () {
-                setState(() {
-                  currentPageIndex = 3;
-                });
-              },
-              color: currentPageIndex == 3 ? Colors.amber : Colors.grey,
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: () {
-                setState(() {
-                  currentPageIndex = 4;
-                });
-              },
-              color: currentPageIndex == 4 ? Colors.amber : Colors.grey,
-            ),
-          ],
-        ),
-      ),
     );
   }
 }

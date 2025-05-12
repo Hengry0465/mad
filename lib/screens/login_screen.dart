@@ -1,5 +1,7 @@
+//current project
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:mad/overview.dart';
 import 'forgot_password_screen.dart';
 import 'profile_screen.dart';
 
@@ -39,7 +41,7 @@ class _LoginScreenState extends State<LoginScreen> {
       
       if (mounted) {
         Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (context) => const ProfileScreen()),
+          MaterialPageRoute(builder: (context) => const Overview()),
           (route) => false,
         );
       }

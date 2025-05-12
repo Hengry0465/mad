@@ -4,9 +4,17 @@ import 'package:flutter/material.dart';
 import 'screens/welcome_screen.dart';
 import 'screens/profile_screen.dart';
 import 'firebase_options.dart';
+import 'overview.dart';
+import 'notification_service.dart';
+import 'permission_dialog.dart';
+import 'dept.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 初始化通知服务
+  await NotificationService.initialize();
+
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
@@ -19,9 +27,9 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Authentication App',
+      title: 'MoneyPax',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.amber), // 使用黄色主题
         useMaterial3: true,
       ),
       home: StreamBuilder<User?>(
@@ -30,11 +38,12 @@ class MyApp extends StatelessWidget {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
-          
+
           if (snapshot.hasData) {
-            return const ProfileScreen();
+            // 用户已登录，返回导航控制器
+            return const MainNavigationScreen();
           }
-          
+
           return const WelcomeScreen();
         },
       ),
