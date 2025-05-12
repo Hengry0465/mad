@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:mad/addTransaction.dart';
 import 'package:mad/history.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'accountmodule/profile_screen.dart';
 import 'all_report.dart';
 import 'dept.dart';
 import 'dept_service.dart';
@@ -260,7 +261,9 @@ class _MyHomePageState extends State<MyHomePage> {
                         IconButton(
                           icon: const Icon(Icons.person, color: Colors.blue),
                           onPressed: () {
-                            // 导航到个人资料页面的占位
+                            Navigator.push(
+                                context,
+                                MaterialPageRoute(builder: (context) => const ProfileScreen()),);
                           },
                         ),
                       ],
