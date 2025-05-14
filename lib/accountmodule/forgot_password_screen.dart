@@ -14,7 +14,6 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   final _newPasswordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   bool _isLoading = false;
-  bool _emailSent = false;
   bool _obscurePassword = true;
   bool _obscureConfirmPassword = true;
 
@@ -34,48 +33,25 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     });
 
     try {
-      if (!_emailSent) {
-        // Send password reset email
-        await FirebaseAuth.instance.sendPasswordResetEmail(
-          email: _emailController.text.trim(),
+      // Get the user credential first
+      final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(_emailController.text.trim());
+      if (methods.isEmpty) {
+        throw FirebaseAuthException(code: 'user-not-found');
+      }
+
+      // Send password reset email without verification
+      await FirebaseAuth.instance.sendPasswordResetEmail(
+        email: _emailController.text.trim(),
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Password reset link sent to your email. Please use that to reset your password.'),
+            backgroundColor: Colors.green,
+          ),
         );
-        
-        setState(() {
-          _emailSent = true;
-        });
-        
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Password reset email sent! Please check your email.'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
-      } else {
-        // Verify the email and update password
-        final user = FirebaseAuth.instance.currentUser;
-        if (user != null && user.email == _emailController.text.trim()) {
-          await user.updatePassword(_newPasswordController.text.trim());
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Password updated successfully!'),
-                backgroundColor: Colors.green,
-              ),
-            );
-            Navigator.pop(context);
-          }
-        } else {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Please verify your email first'),
-                backgroundColor: Colors.red,
-              ),
-            );
-          }
-        }
+        Navigator.pop(context);
       }
     } on FirebaseAuthException catch (e) {
       String message = 'An error occurred';
@@ -88,7 +64,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
       } else if (e.code == 'network-request-failed') {
         message = 'Network error. Please check your connection';
       }
-      
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -173,7 +149,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Enter your email to reset your password',
+                          'Enter your email to receive a password reset link',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             fontSize: 16,
@@ -181,7 +157,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                           ),
                         ),
                         const SizedBox(height: 32),
-                        // Email
+                        // Email field
                         Align(
                           alignment: Alignment.centerLeft,
                           child: Text(
@@ -216,117 +192,20 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                             return null;
                           },
                         ),
-                        if (_emailSent) ...[
-                          const SizedBox(height: 16),
-                          // New Password
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              'New Password',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.grey[800],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          TextFormField(
-                            controller: _newPasswordController,
-                            obscureText: _obscurePassword,
-                            decoration: InputDecoration(
-                              prefixIcon: const Icon(Icons.vpn_key),
-                              suffixIcon: IconButton(
-                                icon: Icon(_obscurePassword
-                                    ? Icons.visibility
-                                    : Icons.visibility_off),
-                                onPressed: () {
-                                  setState(() {
-                                    _obscurePassword = !_obscurePassword;
-                                  });
-                                },
-                              ),
-                              filled: true,
-                              fillColor: Colors.grey[100],
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                                borderSide: BorderSide.none,
-                              ),
-                            ),
-                            validator: (value) {
-                              if (value == null || value.isEmpty) {
-                                return 'Please enter a new password';
-                              }
-                              if (value.length < 6) {
-                                return 'Password must be at least 6 characters';
-                              }
-                              return null;
-                            },
-                          ),
-                          const SizedBox(height: 16),
-                          // Confirm Password
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              'Confirm Password',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.grey[800],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          TextFormField(
-                            controller: _confirmPasswordController,
-                            obscureText: _obscureConfirmPassword,
-                            decoration: InputDecoration(
-                              prefixIcon: const Icon(Icons.vpn_key),
-                              suffixIcon: IconButton(
-                                icon: Icon(_obscureConfirmPassword
-                                    ? Icons.visibility
-                                    : Icons.visibility_off),
-                                onPressed: () {
-                                  setState(() {
-                                    _obscureConfirmPassword = !_obscureConfirmPassword;
-                                  });
-                                },
-                              ),
-                              filled: true,
-                              fillColor: Colors.grey[100],
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                                borderSide: BorderSide.none,
-                              ),
-                            ),
-                            validator: (value) {
-                              if (value == null || value.isEmpty) {
-                                return 'Please confirm your password';
-                              }
-                              if (value != _newPasswordController.text) {
-                                return 'Passwords do not match';
-                              }
-                              return null;
-                            },
-                          ),
-                        ],
                         const SizedBox(height: 24),
-                        // Reset Password button
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton(
+                            onPressed: _isLoading ? null : _resetPassword,
                             style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFFFFC700),
-                              foregroundColor: Colors.black,
                               padding: const EdgeInsets.symmetric(vertical: 16),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
                               ),
-                              textStyle: const TextStyle(
-                                  fontSize: 18, fontWeight: FontWeight.bold),
                             ),
-                            onPressed: _isLoading ? null : _resetPassword,
                             child: _isLoading
                                 ? const CircularProgressIndicator()
-                                : Text(_emailSent ? 'Update Password' : 'Send Reset Link'),
+                                : const Text('Send Reset Link'),
                           ),
                         ),
                       ],
@@ -340,4 +219,4 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
       ),
     );
   }
-} 
+}

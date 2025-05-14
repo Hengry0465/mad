@@ -51,7 +51,12 @@ dependencies:
   pdf: ^3.6.0
   syncfusion_flutter_charts: ^29.1.41
   syncfusion_flutter_datepicker: ^29.1.41
-
+  fl_chart: ^0.65.0
+  excel: ^2.0.0           # For creating and reading Excel files
+  csv: ^5.0.1             # For CSV processing
+  mime: ^1.0.2            # For MIME type detection
+  xml: ^6.0.1
+  table_calendar: ^3.0.9
 
 dev_dependencies:
   flutter_test:
