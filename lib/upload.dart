@@ -60,7 +60,12 @@ class _UploadScreenState extends State<UploadScreen> {
 
         if (fileData['localPath'] != null) {
           File localFile = File(fileData['localPath']);
-          if (await localFile.exists()) {
+          bool fileExists = await localFile.exists();
+
+          // Add file existence status to the file data
+          fileData['fileExists'] = fileExists;
+
+          if (fileExists) {
             // Additional check to make sure it's not a PDF file
             if (fileData['name']?.toLowerCase()?.endsWith('.pdf') == true) {
               await localFile.delete(); // Delete the file
@@ -69,9 +74,20 @@ class _UploadScreenState extends State<UploadScreen> {
               continue;
             }
             files.add(fileData);
+
+            // Update file existence status in Firestore if needed
+            if (fileData['fileExists'] != true) {
+              batch.update(doc.reference, {'fileExists': true});
+              needsBatchCommit = true;
+            }
           } else {
-            batch.delete(doc.reference);
+            // Mark as not existing in the database, but don't delete the entry
+            batch.update(doc.reference, {'fileExists': false});
             needsBatchCommit = true;
+
+            // Still add to the list but with a flag
+            fileData['fileExists'] = false;
+            files.add(fileData);
           }
         }
       }
@@ -94,6 +110,10 @@ class _UploadScreenState extends State<UploadScreen> {
   }
 
   Future<void> _pickAndUploadFile() async {
+    setState(() {
+      _isUploading = true;
+    });
+
     try {
       // Use FileType.any to allow selecting any file (so we can check and show proper error for PDF files)
       FilePickerResult? result = await FilePicker.platform.pickFiles();
@@ -101,48 +121,15 @@ class _UploadScreenState extends State<UploadScreen> {
       if (result != null) {
         PlatformFile file = result.files.first;
 
-        Directory tempDir = await getTemporaryDirectory();
-        String tempPath = '${tempDir.path}/temp_${file.name}';
-        File tempFile = File(tempPath);
-
-        if (file.bytes != null) {
-          await tempFile.writeAsBytes(file.bytes!);
-        } else if (file.path != null) {
-          await File(file.path!).copy(tempPath);
-        } else {
-          throw Exception('No file data available');
-        }
-
-        Directory appDocDir = await getApplicationDocumentsDirectory();
-        String fileName = '${DateTime.now().millisecondsSinceEpoch}_${file.name}';
-        String filePath = '${appDocDir.path}/uploads/$fileName';
-
-        Directory uploadsDir = Directory('${appDocDir.path}/uploads');
-        if (!await uploadsDir.exists()) {
-          await uploadsDir.create(recursive: true);
-        }
-
-        File localFile = File(filePath);
-        await tempFile.copy(filePath);
-        await tempFile.delete();
-
-        if (!await localFile.exists()) {
-          throw Exception('Failed to save file locally');
-        }
-
-        // Double-check file type before saving to database
+        // Check file type before proceeding
         String fileExtension = file.name.split('.').last.toLowerCase();
         if (fileExtension == 'pdf') {
-          // Handle case where somehow a PDF file made it through
-          await localFile.delete(); // Clean up
           setState(() {
             _isUploading = false;
           });
           _showPdfErrorDialog();
           return;
         } else if (fileExtension != 'csv' && fileExtension != 'xlsx') {
-          // Handle other unsupported file types
-          await localFile.delete(); // Clean up
           setState(() {
             _isUploading = false;
           });
@@ -150,6 +137,46 @@ class _UploadScreenState extends State<UploadScreen> {
           return;
         }
 
+        // Create necessary directories
+        Directory appDocDir = await getApplicationDocumentsDirectory();
+        Directory uploadsDir = Directory('${appDocDir.path}/uploads');
+        if (!await uploadsDir.exists()) {
+          await uploadsDir.create(recursive: true);
+        }
+
+        // Generate unique filename
+        String fileName = '${DateTime.now().millisecondsSinceEpoch}_${file.name}';
+        String filePath = '${appDocDir.path}/uploads/$fileName';
+        File localFile = File(filePath);
+
+        // Copy file from source to destination
+        if (file.bytes != null) {
+          // For web platform
+          await localFile.writeAsBytes(file.bytes!);
+        } else if (file.path != null) {
+          // For mobile platforms
+          File sourceFile = File(file.path!);
+          if (await sourceFile.exists()) {
+            await sourceFile.copy(filePath);
+          } else {
+            throw Exception('Source file does not exist: ${file.path}');
+          }
+        } else {
+          throw Exception('No file data available');
+        }
+
+        // Verify file was created successfully
+        if (!await localFile.exists()) {
+          throw Exception('Failed to create local file copy');
+        }
+
+        int fileSize = await localFile.length();
+        if (fileSize == 0) {
+          await localFile.delete(); // Clean up empty file
+          throw Exception('Created file is empty');
+        }
+
+        // Save to Firestore
         DocumentReference docRef = await _firestore
             .collection('users')
             .doc(_currentUser!.uid)
@@ -158,13 +185,17 @@ class _UploadScreenState extends State<UploadScreen> {
           'name': file.name,
           'fileName': fileName,
           'localPath': filePath,
-          'size': file.size,
+          'size': fileSize,
           'uploadedAt': Timestamp.now(),
-          'type': file.extension?.toLowerCase(),
+          'type': fileExtension,
+          'fileExists': true,
         });
 
+        // Verify document was created
         DocumentSnapshot verifyDoc = await docRef.get();
         if (!verifyDoc.exists) {
+          // Clean up file if document wasn't created
+          await localFile.delete();
           throw Exception('Failed to save file metadata');
         }
 
@@ -204,6 +235,36 @@ class _UploadScreenState extends State<UploadScreen> {
         return;
       } else if (fileType != 'csv' && fileType != 'xlsx') {
         _showErrorSnackBar('Unsupported file type. Only CSV and XLSX files can be analyzed.');
+        setState(() {
+          _isAnalyzing = false;
+        });
+        return;
+      }
+
+      // Check if file exists before analyzing
+      if (fileData['localPath'] != null) {
+        File localFile = File(fileData['localPath']);
+        if (!await localFile.exists()) {
+          _showErrorSnackBar('File not found on device');
+
+          // Update file existence status in database
+          await _firestore
+              .collection('users')
+              .doc(_currentUser!.uid)
+              .collection('uploaded_files')
+              .doc(fileData['id'])
+              .update({
+            'fileExists': false,
+          });
+
+          await _loadUploadedFiles();
+          setState(() {
+            _isAnalyzing = false;
+          });
+          return;
+        }
+      } else {
+        _showErrorSnackBar('File path not found');
         setState(() {
           _isAnalyzing = false;
         });
@@ -776,6 +837,133 @@ class _UploadScreenState extends State<UploadScreen> {
     await _loadUploadedFiles();
   }
 
+  // Enhanced file opening method with better error handling and debugging
+  Future<void> _openFile(Map<String, dynamic> fileData) async {
+    try {
+      if (_isAnalyzing) {
+        _showErrorSnackBar('Please wait until analysis is complete');
+        return;
+      }
+
+      if (fileData['localPath'] == null) {
+        _showErrorSnackBar('File path not found');
+        return;
+      }
+
+      final String filePath = fileData['localPath'];
+      final File file = File(filePath);
+
+      // Check if file exists
+      if (!await file.exists()) {
+        print('File does not exist at path: $filePath');
+        _showErrorSnackBar('File not found on device');
+
+        // Update the UI to reflect that file is missing
+        await _firestore
+            .collection('users')
+            .doc(_currentUser!.uid)
+            .collection('uploaded_files')
+            .doc(fileData['id'])
+            .update({
+          'fileExists': false,
+        });
+
+        await _loadUploadedFiles();
+        return;
+      }
+
+      // Check file size just to make sure it's valid
+      final fileSize = await file.length();
+      if (fileSize == 0) {
+        _showErrorSnackBar('File is empty');
+        return;
+      }
+
+      print('Attempting to open file: $filePath');
+      print('File exists: ${await file.exists()}');
+      print('File size: ${await file.length()} bytes');
+
+      // For debugging purposes, try to read a small chunk of the file
+      try {
+        final bytes = await file.readAsBytes().timeout(const Duration(seconds: 1));
+        print('Successfully read ${bytes.length} bytes from file');
+      } catch (e) {
+        print('Error reading file bytes: $e');
+      }
+
+      // Check if file is CSV or Excel before opening
+      final String fileName = file.path.toLowerCase();
+      if (fileName.endsWith('.csv') || fileName.endsWith('.xlsx')) {
+        // Try opening the file with platform-specific options
+        final result = await OpenFile.open(
+          filePath,
+          type: fileName.endsWith('.csv') ? 'text/csv' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+
+        print('OpenFile result: ${result.message}, ${result.type}');
+
+        if (result.type != ResultType.done) {
+          _showOpenFileErrorDialog(result.message);
+        } else {
+          _showSuccessSnackBar('File opened successfully');
+        }
+      } else {
+        _showErrorSnackBar('Unsupported file type');
+      }
+    } catch (e) {
+      print('Error opening file: $e');
+      _showOpenFileErrorDialog('Error opening file: $e');
+    }
+  }
+
+  // New method to show a more helpful error dialog for file opening issues
+  void _showOpenFileErrorDialog(String errorMessage) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.error_outline, color: Colors.red),
+            SizedBox(width: 8),
+            Expanded(child: Text('Could Not Open File')),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('There was a problem opening this file:'),
+            SizedBox(height: 8),
+            Container(
+              padding: EdgeInsets.all(8),
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Colors.grey[100],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                errorMessage,
+                style: TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+            ),
+            SizedBox(height: 16),
+            Text('Troubleshooting tips:'),
+            SizedBox(height: 4),
+            Text('• Make sure you have an app installed that can open this file type'),
+            Text('• Try exporting the file to a different format'),
+            Text('• Check if the file has been moved or deleted'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   // Enhanced error dialog with debug information
   void _showDetailedErrorDialog(String title, String message, Map<String, dynamic> debugData) {
     showDialog(
@@ -1161,6 +1349,20 @@ class _UploadScreenState extends State<UploadScreen> {
             Text('Uploaded: ${_formatDate(fileData['uploadedAt'])}'),
             if (fileData['analyzedAt'] != null)
               Text('Analyzed: ${_formatDate(fileData['analyzedAt'])}'),
+            if (fileData['fileExists'] == false)
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning, color: Colors.red, size: 16),
+                    SizedBox(width: 4),
+                    Text(
+                      'File missing from device',
+                      style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ),
         actions: [
@@ -1179,35 +1381,20 @@ class _UploadScreenState extends State<UploadScreen> {
               ),
               child: const Text('View Analysis'),
             ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _openFile(fileData);
-            },
-            style: TextButton.styleFrom(
-              foregroundColor: const Color(0xFFFFC700),
+          if (fileData['fileExists'] != false)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _openFile(fileData);
+              },
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFFFFC700),
+              ),
+              child: const Text('Open File'),
             ),
-            child: const Text('Open File'),
-          ),
         ],
       ),
     );
-  }
-
-  Future<void> _openFile(Map<String, dynamic> fileData) async {
-    try {
-      if (fileData['localPath'] != null) {
-        File file = File(fileData['localPath']);
-        if (await file.exists()) {
-          await OpenFile.open(fileData['localPath']);
-        } else {
-          _showErrorSnackBar('File not found');
-        }
-      }
-    } catch (e) {
-      print('Error opening file: $e');
-      _showErrorSnackBar('Error opening file: $e');
-    }
   }
 
   String _formatFileSize(int bytes) {
@@ -1323,6 +1510,141 @@ class _UploadScreenState extends State<UploadScreen> {
           ),
         ],
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+    );
+  }
+
+  void _showFileOptions(Map<String, dynamic> file) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              file['name'],
+              style: const TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+
+            // Add file existence indicator
+            if (file['fileExists'] == false)
+              Container(
+                margin: EdgeInsets.only(top: 8),
+                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade100,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'File missing',
+                  style: TextStyle(
+                    color: Colors.red.shade700,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+
+            const SizedBox(height: 20),
+            ListTile(
+              leading: const Icon(Icons.info_outline, color: Color(0xFFFFC700)),
+              title: const Text('View Details'),
+              onTap: () {
+                Navigator.pop(context);
+                _showFileDetails(file);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.open_in_new, color: Color(0xFFFFC700)),
+              title: const Text('Open File'),
+              enabled: file['fileExists'] != false,
+              onTap: file['fileExists'] == false ? null : () {
+                Navigator.pop(context);
+                _openFile(file);
+              },
+            ),
+            ListTile(
+              leading: Icon(
+                _isAnalyzing ? Icons.hourglass_empty : Icons.analytics,
+                color: (_isAnalyzing || file['fileExists'] == false) ? Colors.grey : const Color(0xFFFFC700),
+              ),
+              title: Text(_isAnalyzing ? 'Analyzing...' : 'Analyze'),
+              enabled: !_isAnalyzing && file['fileExists'] != false,
+              onTap: (_isAnalyzing || file['fileExists'] == false)
+                  ? null
+                  : () {
+                Navigator.pop(context);
+                _analyzeFile(file);
+              },
+            ),
+            if (file['analysisResult'] != null)
+              ListTile(
+                leading: const Icon(Icons.assessment, color: Color(0xFFFFC700)),
+                title: const Text('View Analysis'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showAnalysisResult(file['analysisResult']);
+                },
+              ),
+            const Divider(),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Colors.red),
+              title: const Text(
+                'Delete',
+                style: TextStyle(color: Colors.red),
+              ),
+              onTap: () {
+                Navigator.pop(context);
+                _showDeleteConfirmation(file);
+              },
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showDeleteConfirmation(Map<String, dynamic> file) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Delete File'),
+        content: Text('Are you sure you want to delete "${file['name']}"?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await _deleteFile(file);
+            },
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
       ),
     );
   }
@@ -1510,7 +1832,9 @@ class _UploadScreenState extends State<UploadScreen> {
                         file['type'] == 'csv'
                             ? Icons.table_chart
                             : Icons.description,
-                        color: const Color(0xFFFFC700),
+                        color: file['fileExists'] == false
+                            ? Colors.grey
+                            : const Color(0xFFFFC700),
                         size: 24,
                       ),
                     ),
@@ -1554,6 +1878,27 @@ class _UploadScreenState extends State<UploadScreen> {
                         const SizedBox(height: 4),
                         Row(
                           children: [
+                            if (file['fileExists'] == false)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.red.shade100,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(
+                                  'Missing',
+                                  style: TextStyle(
+                                    color: Colors.red.shade800,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            if (file['fileExists'] == false && file['analysisResult'] != null)
+                              SizedBox(width: 4),
                             if (file['analysisResult'] != null)
                               Container(
                                 padding: const EdgeInsets.symmetric(
@@ -1587,119 +1932,6 @@ class _UploadScreenState extends State<UploadScreen> {
                 );
               },
             ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showFileOptions(Map<String, dynamic> file) {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (context) => Container(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 20),
-            Text(
-              file['name'],
-              style: const TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            const SizedBox(height: 20),
-            ListTile(
-              leading: const Icon(Icons.info_outline, color: Color(0xFFFFC700)),
-              title: const Text('View Details'),
-              onTap: () {
-                Navigator.pop(context);
-                _showFileDetails(file);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.open_in_new, color: Color(0xFFFFC700)),
-              title: const Text('Open File'),
-              onTap: () {
-                Navigator.pop(context);
-                _openFile(file);
-              },
-            ),
-            ListTile(
-              leading: Icon(
-                _isAnalyzing ? Icons.hourglass_empty : Icons.analytics,
-                color: _isAnalyzing ? Colors.grey : const Color(0xFFFFC700),
-              ),
-              title: Text(_isAnalyzing ? 'Analyzing...' : 'Analyze'),
-              onTap: _isAnalyzing
-                  ? null
-                  : () {
-                Navigator.pop(context);
-                _analyzeFile(file);
-              },
-            ),
-            if (file['analysisResult'] != null)
-              ListTile(
-                leading: const Icon(Icons.assessment, color: Color(0xFFFFC700)),
-                title: const Text('View Analysis'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _showAnalysisResult(file['analysisResult']);
-                },
-              ),
-            const Divider(),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, color: Colors.red),
-              title: const Text(
-                'Delete',
-                style: TextStyle(color: Colors.red),
-              ),
-              onTap: () {
-                Navigator.pop(context);
-                _showDeleteConfirmation(file);
-              },
-            ),
-            const SizedBox(height: 20),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showDeleteConfirmation(Map<String, dynamic> file) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Delete File'),
-        content: Text('Are you sure you want to delete "${file['name']}"?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              await _deleteFile(file);
-            },
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Delete'),
           ),
         ],
       ),

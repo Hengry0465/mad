@@ -7,7 +7,8 @@ import 'dart:async'; // Import for StreamSubscription
 import 'upload.dart';
 
 class ReportPage extends StatefulWidget {
-  const ReportPage({Key? key}) : super(key: key);
+  final bool fromUpload; // Add this parameter to indicate if coming from upload
+  const ReportPage({Key? key, this.fromUpload = false}) : super(key: key);
 
   @override
   State<ReportPage> createState() => _ReportPageState();
@@ -31,6 +32,8 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
   bool _isRefreshing = false;
   List<Map<String, dynamic>> _transactions = [];
   Map<String, dynamic> _summary = {};
+  bool _previouslyHadTransactions = false; // Track previous transaction state
+  List<Map<String, dynamic>> _allTransactions = []; // Store all transactions
 
   // Cached data for performance
   List<ChartData> _cachedTypeData = [];
@@ -46,6 +49,7 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
   bool _showCharts = true;
   int _selectedTabIndex = 0;
   bool _isNavigating = false;
+  bool _needsDataRefresh = false; // Add flag to track if we need a data refresh
 
   // Filter options
   final List<String> _periodOptions = [
@@ -67,7 +71,18 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
   void initState() {
     super.initState();
     _initializeAnimations();
-    _loadTransactionData();
+
+    // If coming from upload page, force immediate data refresh
+    if (widget.fromUpload) {
+      _needsDataRefresh = true;
+      // Set a slight delay to ensure Firebase has processed the upload
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _loadTransactionData(forceReload: true);
+      });
+    } else {
+      _loadTransactionData();
+    }
+
     _setupFileListener(); // Add file listener
   }
 
@@ -118,8 +133,14 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
         .collection('uploaded_files')
         .snapshots()
         .listen((snapshot) {
-      // Only reload data if this isn't the initial load and we're not already refreshing
-      if (!_isLoading && !_isRefreshing) {
+      // If this is the first load after initialization, we want to refresh
+      if (_needsDataRefresh) {
+        print('Files collection changed, refreshing report data...');
+        _loadTransactionData(isAutoRefresh: false, forceReload: true);
+        _needsDataRefresh = false;
+      }
+      // If we're not in the initial loading state and not already refreshing
+      else if (!_isLoading && !_isRefreshing) {
         print('Files collection changed, refreshing report data...');
         _loadTransactionData(isAutoRefresh: true);
       }
@@ -128,7 +149,7 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
     });
   }
 
-  Future<void> _loadTransactionData({bool isAutoRefresh = false}) async {
+  Future<void> _loadTransactionData({bool isAutoRefresh = false, bool forceReload = false}) async {
     if (_currentUser == null) return;
 
     setState(() {
@@ -144,6 +165,9 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
       _fadeController.reset();
       _slideController.reset();
 
+      // Remember if we previously had transactions before loading new data
+      _previouslyHadTransactions = _transactions.isNotEmpty || _allTransactions.isNotEmpty;
+
       // Get all analyzed files from Firestore
       final QuerySnapshot filesSnapshot = await _firestore
           .collection('users')
@@ -154,6 +178,7 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
           .get();
 
       List<Map<String, dynamic>> allTransactions = [];
+      DateTime? mostRecentTransactionDate;
 
       // Extract transaction data from each file
       for (var doc in filesSnapshot.docs) {
@@ -169,34 +194,76 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
             DateTime? transactionDate = _parseTransactionDate(transaction['date']);
 
             if (transactionDate != null) {
-              if (transactionDate.isAfter(_startDate.subtract(const Duration(days: 1))) &&
-                  transactionDate.isBefore(_endDate.add(const Duration(days: 1)))) {
-
-                allTransactions.add({
-                  ...transaction,
-                  'parsedDate': transactionDate,
-                  'period': period,
-                  'fileId': doc.id,
-                  'fileName': fileData['name'],
-                  'walletType': _extractWalletType(fileData['name']),
-                });
+              // Update most recent transaction date if needed
+              if (mostRecentTransactionDate == null ||
+                  transactionDate.isAfter(mostRecentTransactionDate)) {
+                mostRecentTransactionDate = transactionDate;
               }
+
+              allTransactions.add({
+                ...transaction,
+                'parsedDate': transactionDate,
+                'period': period,
+                'fileId': doc.id,
+                'fileName': fileData['name'],
+                'walletType': _extractWalletType(fileData['name']),
+              });
             }
           }
         }
       }
 
+      // Store all transactions for potential reuse
+      _allTransactions = allTransactions;
+
       // Sort transactions by date (newest first)
-      allTransactions.sort((a, b) => b['parsedDate'].compareTo(a['parsedDate']));
+      _allTransactions.sort((a, b) => b['parsedDate'].compareTo(a['parsedDate']));
+
+      // If we found transactions and we're coming from an upload or forced reload,
+      // adjust the date range to ensure we capture the most recent transactions
+      if (forceReload && _allTransactions.isNotEmpty && mostRecentTransactionDate != null) {
+        // If the most recent transaction is older than a month from now,
+        // reset the date range to include that transaction
+        DateTime oneMonthAgo = DateTime.now().subtract(const Duration(days: 30));
+
+        if (mostRecentTransactionDate.isBefore(oneMonthAgo)) {
+          // Create a range starting from 30 days before the most recent transaction
+          DateTime newStartDate = mostRecentTransactionDate.subtract(const Duration(days: 30));
+          DateTime newEndDate = DateTime.now();
+
+          setState(() {
+            _startDate = newStartDate;
+            _endDate = newEndDate;
+            _selectedPeriod = 'Custom range';
+          });
+
+          // Show a snackbar to inform the user
+          if (mounted) {
+            _showInfoSnackBar('Adjusted date range to show recent transactions');
+          }
+        }
+      }
+
+      // Filter transactions based on date range
+      List<Map<String, dynamic>> filteredTransactions = _allTransactions.where((transaction) {
+        DateTime date = transaction['parsedDate'];
+        return date.isAfter(_startDate.subtract(const Duration(days: 1))) &&
+            date.isBefore(_endDate.add(const Duration(days: 1)));
+      }).toList();
 
       // Calculate summary data with caching
-      await _calculateEnhancedSummary(allTransactions);
+      await _calculateEnhancedSummary(filteredTransactions);
 
       setState(() {
-        _transactions = allTransactions;
+        _transactions = filteredTransactions;
         _isLoading = false;
         _isRefreshing = false;
       });
+
+      // If we refreshed and found no transactions, check if we should reset date range
+      if (forceReload && filteredTransactions.isEmpty && _allTransactions.isNotEmpty) {
+        _showResetDateRangeDialog();
+      }
 
       // Start animations - only do full animations on initial load, not on auto-refresh
       if (!isAutoRefresh) {
@@ -217,6 +284,64 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
         });
       }
     }
+  }
+
+  // Show info snackbar for non-error notifications
+  void _showInfoSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.info_outline, color: Colors.white),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: _primaryColor,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        duration: const Duration(seconds: 4),
+        margin: const EdgeInsets.all(16),
+      ),
+    );
+  }
+
+  // Show dialog asking if user wants to reset date range
+  void _showResetDateRangeDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('No Transactions Found'),
+          content: const Text(
+              'No transactions found in the selected date range. Would you like to reset to the default range (Last 30 days)?'
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: const Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: const Text('Reset'),
+              onPressed: () {
+                Navigator.of(context).pop();
+                _updateDateRange('Last 30 days');
+              },
+            ),
+          ],
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        );
+      },
+    );
   }
 
   String _extractWalletType(String fileName) {
@@ -514,7 +639,6 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
     );
   }
 
-  // Show a subtle notification for auto-refresh
   // Navigation with loading screen
   void _navigateToUploadScreen() async {
     setState(() {
@@ -535,7 +659,12 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
       if (mounted) {
         setState(() {
           _isNavigating = false;
+          // Set flag to refresh data when returning from upload
+          _needsDataRefresh = true;
         });
+
+        // Force data refresh when returning from upload page
+        _loadTransactionData(forceReload: true);
       }
     });
   }
@@ -664,10 +793,8 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
           )
               : const Icon(Icons.refresh, color: _textPrimary),
           onPressed: _isRefreshing ? null : () {
-            setState(() {
-              _isRefreshing = true;
-            });
-            _loadTransactionData();
+            // Force reload when manually refreshing
+            _loadTransactionData(forceReload: true);
           },
         ),
         const SizedBox(width: 8),
@@ -741,35 +868,88 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
               ),
             ),
             const SizedBox(height: 12),
-            const Text(
-              'Upload and analyze your e-wallet statements to get detailed insights about your spending patterns',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 16,
-                color: _textSecondary,
-                height: 1.5,
-              ),
+            Column(
+              children: [
+                if (_allTransactions.isNotEmpty) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'Current date range: ${DateFormat('MMM dd, yyyy').format(_startDate)} - ${DateFormat('MMM dd, yyyy').format(_endDate)}',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w500,
+                        fontSize: 14,
+                        color: _textSecondary,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                Text(
+                  _allTransactions.isNotEmpty
+                      ? 'No transactions found in the selected date range'
+                      : 'Upload and analyze your e-wallet statements to get detailed insights about your spending patterns',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    color: _textSecondary,
+                    height: 1.5,
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 32),
-            ElevatedButton.icon(
-              onPressed: _isNavigating ? null : _navigateToUploadScreen,
-              icon: const Icon(Icons.upload_file, size: 20),
-              label: const Text(
-                'Upload Statement',
-                style: TextStyle(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 16,
-                ),
-              ),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _primaryColor,
-                foregroundColor: _textPrimary,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-              ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                if (_allTransactions.isNotEmpty) ...[
+                  ElevatedButton.icon(
+                    onPressed: _isNavigating ? null : () => _updateDateRange('Last 30 days'),
+                    icon: const Icon(Icons.date_range, size: 20),
+                    label: const Text(
+                      'Reset Date Range',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 16,
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _primaryColor,
+                      foregroundColor: _textPrimary,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                ] else ...[
+                  ElevatedButton.icon(
+                    onPressed: _isNavigating ? null : _navigateToUploadScreen,
+                    icon: const Icon(Icons.upload_file, size: 20),
+                    label: const Text(
+                      'Upload Statement',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 16,
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _primaryColor,
+                      foregroundColor: _textPrimary,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ],
         ),
@@ -819,62 +999,88 @@ class _ReportPageState extends State<ReportPage> with TickerProviderStateMixin {
           ),
         ],
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey.shade200),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: DropdownButtonFormField<String>(
-                decoration: const InputDecoration(
-                  contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  border: InputBorder.none,
-                ),
-                value: _selectedPeriod,
-                items: _periodOptions.map((String value) {
-                  return DropdownMenuItem<String>(
-                    value: value,
-                    child: Text(
-                      value,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w500,
-                        color: _textPrimary,
-                      ),
+          // Add date range display
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                Icon(Icons.date_range, size: 16, color: _primaryColor),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Period: ${DateFormat('MMM dd, yyyy').format(_startDate)} - ${DateFormat('MMM dd, yyyy').format(_endDate)}',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: _textSecondary,
                     ),
-                  );
-                }).toList(),
-                onChanged: (String? newValue) {
-                  if (newValue != null) {
-                    _updateDateRange(newValue);
-                  }
-                },
-              ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(width: 12),
-          GestureDetector(
-            onTap: () => _selectCustomDateRange(context),
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: _primaryColor,
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: [
-                  BoxShadow(
-                    color: _primaryColor.withOpacity(0.3),
-                    blurRadius: 8,
-                    offset: const Offset(0, 4),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade200),
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                ],
+                  child: DropdownButtonFormField<String>(
+                    decoration: const InputDecoration(
+                      contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      border: InputBorder.none,
+                    ),
+                    value: _selectedPeriod,
+                    items: _periodOptions.map((String value) {
+                      return DropdownMenuItem<String>(
+                        value: value,
+                        child: Text(
+                          value,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w500,
+                            color: _textPrimary,
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                    onChanged: (String? newValue) {
+                      if (newValue != null) {
+                        _updateDateRange(newValue);
+                      }
+                    },
+                  ),
+                ),
               ),
-              child: Icon(
-                Icons.calendar_today,
-                color: _textPrimary,
-                size: 20,
+              const SizedBox(width: 12),
+              GestureDetector(
+                onTap: () => _selectCustomDateRange(context),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: _primaryColor,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: _primaryColor.withOpacity(0.3),
+                        blurRadius: 8,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: Icon(
+                    Icons.calendar_today,
+                    color: _textPrimary,
+                    size: 20,
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
         ],
       ),
