@@ -257,7 +257,7 @@ class _MyHomePageState extends State<MyHomePage> {
                           onPressed: () {
                             Navigator.push(
                               context,
-                              MaterialPageRoute(builder: (context) => const UploadPage()),);
+                              MaterialPageRoute(builder: (context) => const UploadScreen()),);
                           },
                         ),
                         // 个人资料按钮

@@ -1,1712 +1,1708 @@
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
-import 'dart:io';
-import 'dart:typed_data';
-import 'dart:convert'; // Add for CSV parsing
-import 'package:flutter_pdfview/flutter_pdfview.dart';
-import 'package:open_file/open_file.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:dotted_border/dotted_border.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; // Add for direct Firestore access
-import 'package:syncfusion_flutter_pdf/pdf.dart' as syncpdf; // For PDF text extraction
-import 'package:intl/intl.dart'; // For date parsing
-import 'firebase_file_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:open_file/open_file.dart';
+import 'package:dotted_border/dotted_border.dart';
+import 'dart:io';
 import 'dart:math' as math;
 
-class UploadPage extends StatefulWidget {
-  const UploadPage({Key? key}) : super(key: key);
+class UploadScreen extends StatefulWidget {
+  const UploadScreen({Key? key}) : super(key: key);
 
   @override
-  _UploadPageState createState() => _UploadPageState();
+  State<UploadScreen> createState() => _UploadScreenState();
 }
 
-class _UploadPageState extends State<UploadPage> {
-  List<FirebaseFileInfo> uploadedFiles = [];
-  bool isLoading = true;
-  bool isProcessing = false;
-  final FirebaseFileService _fileService = FirebaseFileService();
+class _UploadScreenState extends State<UploadScreen> {
+  bool _isUploading = false;
+  bool _isAnalyzing = false;
+  List<Map<String, dynamic>> _uploadedFiles = [];
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final User? _currentUser = FirebaseAuth.instance.currentUser;
 
   @override
   void initState() {
     super.initState();
-    _requestPermissions();
-    _loadFiles();
+    _loadUploadedFiles();
   }
 
-  Future<void> _requestPermissions() async {
-    // Request storage permissions
-    await [Permission.storage].request();
+  Future<void> _loadUploadedFiles() async {
+    if (_currentUser == null) return;
+
+    try {
+      final QuerySnapshot snapshot = await _firestore
+          .collection('users')
+          .doc(_currentUser!.uid)
+          .collection('uploaded_files')
+          .orderBy('uploadedAt', descending: true)
+          .limit(50)
+          .get();
+
+      List<Map<String, dynamic>> files = [];
+      WriteBatch batch = _firestore.batch();
+      bool needsBatchCommit = false;
+
+      for (var doc in snapshot.docs) {
+        Map<String, dynamic> fileData = {
+          'id': doc.id,
+          ...doc.data() as Map<String, dynamic>
+        };
+
+        // Skip PDF files or files with no path
+        if (fileData['type'] == 'pdf') {
+          batch.delete(doc.reference); // Remove PDF files from the database
+          needsBatchCommit = true;
+          continue;
+        }
+
+        if (fileData['localPath'] != null) {
+          File localFile = File(fileData['localPath']);
+          if (await localFile.exists()) {
+            // Additional check to make sure it's not a PDF file
+            if (fileData['name']?.toLowerCase()?.endsWith('.pdf') == true) {
+              await localFile.delete(); // Delete the file
+              batch.delete(doc.reference); // Remove from database
+              needsBatchCommit = true;
+              continue;
+            }
+            files.add(fileData);
+          } else {
+            batch.delete(doc.reference);
+            needsBatchCommit = true;
+          }
+        }
+      }
+
+      if (needsBatchCommit) {
+        await batch.commit();
+      }
+
+      if (mounted) {
+        setState(() {
+          _uploadedFiles = files;
+        });
+      }
+    } catch (e) {
+      print('Error loading files: $e');
+      if (mounted) {
+        _showErrorSnackBar('Error loading uploaded files');
+      }
+    }
   }
 
-  Future<void> _loadFiles() async {
+  Future<void> _pickAndUploadFile() async {
+    try {
+      // Use FileType.any to allow selecting any file (so we can check and show proper error for PDF files)
+      FilePickerResult? result = await FilePicker.platform.pickFiles();
+
+      if (result != null) {
+        PlatformFile file = result.files.first;
+
+        Directory tempDir = await getTemporaryDirectory();
+        String tempPath = '${tempDir.path}/temp_${file.name}';
+        File tempFile = File(tempPath);
+
+        if (file.bytes != null) {
+          await tempFile.writeAsBytes(file.bytes!);
+        } else if (file.path != null) {
+          await File(file.path!).copy(tempPath);
+        } else {
+          throw Exception('No file data available');
+        }
+
+        Directory appDocDir = await getApplicationDocumentsDirectory();
+        String fileName = '${DateTime.now().millisecondsSinceEpoch}_${file.name}';
+        String filePath = '${appDocDir.path}/uploads/$fileName';
+
+        Directory uploadsDir = Directory('${appDocDir.path}/uploads');
+        if (!await uploadsDir.exists()) {
+          await uploadsDir.create(recursive: true);
+        }
+
+        File localFile = File(filePath);
+        await tempFile.copy(filePath);
+        await tempFile.delete();
+
+        if (!await localFile.exists()) {
+          throw Exception('Failed to save file locally');
+        }
+
+        // Double-check file type before saving to database
+        String fileExtension = file.name.split('.').last.toLowerCase();
+        if (fileExtension == 'pdf') {
+          // Handle case where somehow a PDF file made it through
+          await localFile.delete(); // Clean up
+          setState(() {
+            _isUploading = false;
+          });
+          _showPdfErrorDialog();
+          return;
+        } else if (fileExtension != 'csv' && fileExtension != 'xlsx') {
+          // Handle other unsupported file types
+          await localFile.delete(); // Clean up
+          setState(() {
+            _isUploading = false;
+          });
+          _showErrorSnackBar('Unsupported file format. Please upload CSV or XLSX files only.');
+          return;
+        }
+
+        DocumentReference docRef = await _firestore
+            .collection('users')
+            .doc(_currentUser!.uid)
+            .collection('uploaded_files')
+            .add({
+          'name': file.name,
+          'fileName': fileName,
+          'localPath': filePath,
+          'size': file.size,
+          'uploadedAt': Timestamp.now(),
+          'type': file.extension?.toLowerCase(),
+        });
+
+        DocumentSnapshot verifyDoc = await docRef.get();
+        if (!verifyDoc.exists) {
+          throw Exception('Failed to save file metadata');
+        }
+
+        await _loadUploadedFiles();
+
+        if (mounted) {
+          _showSuccessSnackBar('File "${file.name}" uploaded successfully!');
+        }
+      }
+    } catch (e) {
+      print('Upload error: $e');
+      if (mounted) {
+        _showErrorSnackBar('Failed to upload file: ${e.toString()}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _analyzeFile(Map<String, dynamic> fileData) async {
     setState(() {
-      isLoading = true;
+      _isAnalyzing = true;
     });
 
     try {
-      // Check if user is logged in
-      if (FirebaseAuth.instance.currentUser == null) {
-        // Navigate to login screen
-        Navigator.pushReplacementNamed(context, '/login');
+      // First check if the file type is supported
+      String fileType = fileData['type'] ?? '';
+      if (fileType == 'pdf') {
+        _showPdfErrorDialog();
+        setState(() {
+          _isAnalyzing = false;
+        });
+        return;
+      } else if (fileType != 'csv' && fileType != 'xlsx') {
+        _showErrorSnackBar('Unsupported file type. Only CSV and XLSX files can be analyzed.');
+        setState(() {
+          _isAnalyzing = false;
+        });
         return;
       }
 
-      // Get files from Firestore
-      final files = await _fileService.getFiles();
-      setState(() {
-        uploadedFiles = files;
-        isLoading = false;
-      });
-    } catch (e) {
-      print('Error loading files: $e');
-      setState(() {
-        isLoading = false;
-      });
-    }
-  }
+      Map<String, dynamic> analysisResult;
+      Map<String, dynamic> rawData = {};
 
-  Future<void> _pickFile() async {
-    try {
-      // Allow multiple file types including images
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.any,
-        allowMultiple: false,
-      );
+      if (fileData['type'] == 'csv') {
+        analysisResult = await _extractTransactionsFromCsv(fileData);
 
-      if (result != null) {
-        final path = result.files.single.path;
-        final name = result.files.single.name;
-
-        if (path != null && name != null) {
-          // Show loading indicator
-          setState(() {
-            isLoading = true;
-          });
-
-          // Get file extension to handle different file types appropriately
-          final fileExtension = name.contains('.')
-              ? name.split('.').last.toLowerCase()
-              : '';
-
-          // Check if the file is a PDF and if it is password protected
-          bool isPasswordProtected = false;
-          if (fileExtension == 'pdf') {
-            isPasswordProtected = await _showPasswordProtectionDialog(
-              context,
-              name,
-            );
+        if (analysisResult['totalTransactions'] == 0) {
+          File localFile = File(fileData['localPath']);
+          if (await localFile.exists()) {
+            String content = await localFile.readAsString();
+            rawData['rawText'] = content.length > 1000 ? content.substring(0, 1000) + '...' : content;
           }
-
-          // Create a file to get size and other info
-          final file = File(path);
-
-          // Upload to Firebase - this should work for any file type
-          final fileId = await _fileService.uploadFile(
-            file,
-            name,
-            isPasswordProtected: isPasswordProtected,
-          );
-
-          // Process the file to extract transactions if it's a supported format
-          List<TransactionRecord> extractedTransactions = [];
-          if (fileExtension == 'pdf') {
-            // Show processing indicator
-            setState(() {
-              isProcessing = true;
-            });
-
-            // Extract transactions from PDF
-            extractedTransactions = await _extractTransactionsFromFile(file, fileExtension, isPasswordProtected);
-
-            // Save transactions to Firestore
-            if (extractedTransactions.isNotEmpty) {
-              await _saveTransactionsToFirestore(extractedTransactions);
-
-              // Show success message with transaction count
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('${extractedTransactions.length} transactions extracted and saved')),
-              );
-            }
-
-            setState(() {
-              isProcessing = false;
-            });
-          }
-
-          // Reload the files list
-          await _loadFiles();
-
-          // Show success message
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('File uploaded successfully')),
-          );
         }
+      } else if (fileData['type'] == 'xlsx') {
+        analysisResult = await _extractTransactionsFromExcel(fileData);
+      } else {
+        _showErrorSnackBar('Unsupported file type');
+        return;
       }
-    } catch (e) {
-      print('Error picking file: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error uploading file: $e')),
-      );
-      setState(() {
-        isLoading = false;
-        isProcessing = false;
-      });
-    }
-  }
 
-  // Method to extract transactions from various file types
-  Future<List<TransactionRecord>> _extractTransactionsFromFile(
-      File file,
-      String fileExtension,
-      bool isPasswordProtected
-      ) async {
-    List<TransactionRecord> transactions = [];
+      if (analysisResult['totalTransactions'] == 0) {
+        analysisResult['rawData'] = rawData;
 
-    try {
-      if (fileExtension == 'pdf') {
-        // Extract from PDF
-        transactions = await _extractFromPDF(file, isPasswordProtected);
-      } else if (fileExtension == 'csv') {
-        // Extract from CSV
-        transactions = await _extractFromCSV(file);
-      } else if (fileExtension == 'xlsx' || fileExtension == 'xls') {
-        // Extract from Excel - this would need additional implementation
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Excel parsing not implemented yet')),
+        await _saveAnalysisResult(fileData['id'], {
+          'status': 'failed',
+          'error': 'No transactions found',
+          'rawData': rawData,
+          'timestamp': Timestamp.now(),
+        });
+
+        _showDetailedErrorDialog(
+            'No transactions found in this file',
+            'The file may not be in the expected format. The system is looking for transaction data with dates, amounts, and status information.',
+            rawData
         );
+        return;
+      }
+
+      await _saveAnalysisResult(fileData['id'], analysisResult);
+
+      if (mounted) {
+        _showSuccessSnackBar('Analysis completed successfully!');
+        _showAnalysisResult(analysisResult);
       }
     } catch (e) {
-      print('Error extracting transactions: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error parsing transactions: $e')),
-      );
-    }
+      print('Analysis error: $e');
 
-    return transactions;
-  }
-
-  // Method to extract transactions from PDF with improved detection
-  Future<List<TransactionRecord>> _extractFromPDF(File file, bool isPasswordProtected) async {
-    List<TransactionRecord> transactions = [];
-
-    try {
-      // Try to open the PDF using Syncfusion
-      syncpdf.PdfDocument? document;
-      String? password;
-      String allText = '';
+      String errorDetails = '';
+      try {
+        errorDetails = e.toString();
+        if (e is Error) {
+          errorDetails += '\n' + StackTrace.current.toString();
+        }
+      } catch (_) {
+        errorDetails = 'Unknown error occurred';
+      }
 
       try {
-        // First try without password
-        document = syncpdf.PdfDocument(
-          inputBytes: await file.readAsBytes(),
+        await _saveAnalysisResult(fileData['id'], {
+          'status': 'error',
+          'error': errorDetails,
+          'timestamp': Timestamp.now(),
+        });
+      } catch (_) {}
+
+      if (mounted) {
+        _showDetailedErrorDialog(
+            'Analysis Failed',
+            'Could not analyze the file. The system encountered an error while processing.',
+            {'error': errorDetails}
         );
-
-        // Extract text from each page
-        syncpdf.PdfTextExtractor extractor = syncpdf.PdfTextExtractor(document);
-        allText = extractor.extractText();
-
-        print("Successfully extracted text from PDF: ${allText.length} characters");
-      } catch (e) {
-        print("Error extracting PDF without password: $e");
-        // PDF might be password protected or encrypted
-        if (document != null) {
-          document.dispose();
-          document = null;
-        }
-
-        if (isPasswordProtected) {
-          // Show dialog to get password
-          password = await _showPDFPasswordInputDialog();
-
-          if (password != null) {
-            try {
-              // Try with password
-              document = syncpdf.PdfDocument(
-                inputBytes: await file.readAsBytes(),
-                password: password,
-              );
-
-              // Extract text from each page
-              syncpdf.PdfTextExtractor extractor = syncpdf.PdfTextExtractor(document);
-              allText = extractor.extractText();
-              print("Successfully extracted text from password-protected PDF");
-            } catch (e) {
-              print("Error extracting password-protected PDF: $e");
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Invalid password or corrupted PDF')),
-              );
-            }
-          }
-        } else {
-          // Try to open as encrypted PDF
-          try {
-            document = syncpdf.PdfDocument(
-              inputBytes: await file.readAsBytes(),
-            );
-
-            // Extract text from each page
-            syncpdf.PdfTextExtractor extractor = syncpdf.PdfTextExtractor(document);
-            allText = extractor.extractText();
-            print("Successfully extracted text from encrypted PDF");
-          } catch (e) {
-            print("Failed to extract encrypted PDF: $e");
-          }
-        }
       }
-
-      // Log the first 500 characters to help debugging
-      if (allText.isNotEmpty) {
-        // Fix 1: Import dart:math and use math.min
-        print("PDF content preview: ${allText.substring(0, math.min(500, allText.length))}");
-
-        // Parse transactions from the extracted text
-        transactions = _parseTransactionsFromText(allText);
-        print("Found ${transactions.length} transactions");
-
-        // If no transactions found, try alternative parsing
-        if (transactions.isEmpty) {
-          transactions = _parseTransactionsAlternative(allText);
-          print("Alternative parsing found ${transactions.length} transactions");
-        }
-      } else {
-        print("No text extracted from PDF");
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isAnalyzing = false;
+        });
       }
-
-      // Dispose document
-      if (document != null) {
-        document.dispose();
-      }
-    } catch (e) {
-      print('Error in PDF extraction process: $e');
     }
-
-    return transactions;
   }
 
-// Alternative parsing for transactions with more flexible patterns
-  List<TransactionRecord> _parseTransactionsAlternative(String text) {
-    List<TransactionRecord> transactions = [];
+  // Helper method to clean extracted text
+  String _cleanExtractedText(String text) {
+    String cleaned = text;
 
-    try {
-      // More relaxed patterns for various date formats
-      RegExp datePattern = RegExp(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}');
+    // Replace multiple spaces with single space
+    cleaned = cleaned.replaceAll(RegExp(r' {2,}'), ' ');
 
-      // Various amount patterns (RM, $, numbers followed by decimal)
-      RegExp amountPattern = RegExp(r'(?:RM|MYR|USD|\$)?\s*\d+(?:[,.]\d+)?');
+    // Fix broken words across lines
+    cleaned = cleaned.replaceAll(RegExp(r'(\w)-\s*\n\s*(\w)'), r'$1$2');
 
-      // Common transaction types
-      List<String> transactionTypes = [
-        'transfer', 'payment', 'deposit', 'withdrawal', 'reload',
-        'duitnow', 'qr', 'purchase', 'income', 'expense', 'salary'
-      ];
+    // Normalize line endings
+    cleaned = cleaned.replaceAll(RegExp(r'\r\n'), '\n');
+    cleaned = cleaned.replaceAll(RegExp(r'\r'), '\n');
 
-      // Split text into lines and clean
-      List<String> lines = text.split('\n')
-          .map((line) => line.trim())
-          .where((line) => line.isNotEmpty)
-          .toList();
+    // Remove excessive empty lines
+    cleaned = cleaned.replaceAll(RegExp(r'\n\s*\n\s*\n'), '\n\n');
 
-      // Process each line
-      for (var line in lines) {
-        // Skip very short lines
-        if (line.length < 5) continue;
-
-        // Convert to lowercase for easier pattern matching
-        String lowerLine = line.toLowerCase();
-
-        // Look for date pattern
-        Match? dateMatch = datePattern.firstMatch(line);
-        if (dateMatch == null) continue;
-
-        try {
-          String dateStr = dateMatch.group(0) ?? '';
-          DateTime date = _parseDate(dateStr);
-
-          // Look for amount pattern
-          Match? amountMatch = amountPattern.firstMatch(line);
-          if (amountMatch == null) continue;
-
-          String amountStr = amountMatch.group(0) ?? '';
-          // Clean the amount string
-          amountStr = amountStr.replaceAll(RegExp(r'[^\d.]'), '');
-          double amount = double.tryParse(amountStr) ?? 0.0;
-
-          if (amount <= 0) continue; // Skip zero or negative amounts
-
-          // Determine transaction type
-          String type = 'Unknown';
-          for (var typeStr in transactionTypes) {
-            if (lowerLine.contains(typeStr)) {
-              type = typeStr.substring(0, 1).toUpperCase() + typeStr.substring(1);
-              break;
-            }
-          }
-
-          // Determine status
-          String status = 'Completed';
-          if (lowerLine.contains('pending') || lowerLine.contains('process')) {
-            status = 'Pending';
-          } else if (lowerLine.contains('fail') || lowerLine.contains('reject')) {
-            status = 'Failed';
-          } else if (lowerLine.contains('cancel')) {
-            status = 'Canceled';
-          } else if (lowerLine.contains('success')) {
-            status = 'Completed';
-          }
-
-          // Create and add transaction record
-          transactions.add(TransactionRecord(
-              date: date,
-              status: status,
-              type: type,
-              amount: amount
-          ));
-        } catch (e) {
-          print('Error parsing transaction line: $e');
-        }
-      }
-    } catch (e) {
-      print('Error in alternative transaction parsing: $e');
-    }
-
-    return transactions;
+    return cleaned;
   }
 
-
-  // Extract transactions from CSV
-  Future<List<TransactionRecord>> _extractFromCSV(File file) async {
-    List<TransactionRecord> transactions = [];
-
-    try {
-      String content = await file.readAsString();
-      List<String> lines = LineSplitter().convert(content);
-
-      if (lines.isNotEmpty) {
-        // Skip header row
-        List<String> headers = lines.first.split(',');
-
-        // Find indices for required fields (date, status, type, amount)
-        int dateIndex = headers.indexWhere((h) => h.toLowerCase().contains('date'));
-        int statusIndex = headers.indexWhere((h) => h.toLowerCase().contains('status'));
-        int typeIndex = headers.indexWhere((h) => h.toLowerCase().contains('type'));
-        int amountIndex = headers.indexWhere((h) => h.toLowerCase().contains('amount'));
-
-        if (dateIndex >= 0 && typeIndex >= 0 && amountIndex >= 0) {
-          // Process data rows
-          for (int i = 1; i < lines.length; i++) {
-            List<String> values = lines[i].split(',');
-            int maxIndex = [dateIndex, statusIndex, typeIndex, amountIndex].reduce(
-                    (a, b) => a > b ? a : b
-            );
-
-            if (values.length > maxIndex) {
-              try {
-                DateTime date = _parseDate(values[dateIndex]);
-                String status = statusIndex >= 0 ? values[statusIndex] : 'Completed';
-                String type = values[typeIndex];
-                String amountStr = values[amountIndex].replaceAll(RegExp(r'[^\d\.-]'), '');
-                double amount = double.tryParse(amountStr) ?? 0;
-
-                transactions.add(TransactionRecord(
-                  date: date,
-                  status: status,
-                  type: type,
-                  amount: amount,
-                ));
-              } catch (e) {
-                print('Error parsing row $i: $e');
-              }
-            }
-          }
-        }
-      }
-    } catch (e) {
-      print('Error extracting CSV: $e');
+  Future<Map<String, dynamic>> _extractTransactionsFromCsv(Map<String, dynamic> fileData) async {
+    File localFile = File(fileData['localPath']);
+    if (!await localFile.exists()) {
+      throw Exception('File not found locally');
     }
 
-    return transactions;
+    String content = await localFile.readAsString();
+    return _analyzeTransactionText(content);
   }
 
-  // Parse transactions from text using pattern matching
-  List<TransactionRecord> _parseTransactionsFromText(String text) {
-    List<TransactionRecord> transactions = [];
+  Future<Map<String, dynamic>> _extractTransactionsFromExcel(Map<String, dynamic> fileData) async {
+    return {
+      'totalTransactions': 0,
+      'error': 'Excel transaction analysis not implemented yet'
+    };
+  }
 
-    // Define patterns for transaction data
-    RegExp datePattern = RegExp(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}-\d{1,2}-\d{2,4}');
-    RegExp amountPattern = RegExp(r'RM\d+\.\d{2}');
+  // Enhanced transaction text analysis specifically for TNG Wallet
+  Map<String, dynamic> _analyzeTransactionText(String text) {
+    List<String> lines = text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    List<Map<String, dynamic>> transactions = [];
 
-    // Split text into lines
-    List<String> lines = text.split('\n');
+    String? transactionPeriod;
+    double totalAmount = 0.0;
+    Map<String, int> transactionTypes = {};
+    Map<String, int> statusCount = {};
 
-    // Look for table headers
-    int headerIndex = -1;
-    for (int i = 0; i < lines.length; i++) {
-      if (lines[i].contains('Date') &&
-          lines[i].contains('Status') &&
-          lines[i].contains('Transaction Type') &&
-          lines[i].contains('Amount')) {
-        headerIndex = i;
+    print('=== ANALYZING TNG WALLET TEXT ===');
+    print('Total lines: ${lines.length}');
+
+    // Print first 30 lines for debugging
+    print('First 30 lines of extracted text:');
+    for (int i = 0; i < math.min(30, lines.length); i++) {
+      print('Line $i: ${lines[i]}');
+    }
+
+    // Extract transaction period with more flexible patterns
+    for (String line in lines) {
+      // Look for the date range pattern anywhere in the line
+      RegExp periodRegex = RegExp(r'(\d{1,2}\s+\w+\s+\d{4}\s*-\s*\d{1,2}\s+\w+\s+\d{4})');
+      var match = periodRegex.firstMatch(line);
+      if (match != null) {
+        transactionPeriod = match.group(1);
+        print('Found transaction period: $transactionPeriod');
         break;
       }
     }
 
-    // Process transaction rows if header found
-    if (headerIndex >= 0) {
-      for (int i = headerIndex + 1; i < lines.length; i++) {
-        String line = lines[i];
+    // Look for transactions using multiple strategies
 
-        // Skip if line is too short
-        if (line.trim().length < 10) continue;
+    // Strategy 1: Find table with headers
+    int tableStart = _findTransactionTable(lines);
 
-        try {
-          // Extract date
-          Match? dateMatch = datePattern.firstMatch(line);
-          if (dateMatch == null) continue;
+    // Strategy 2: If no table found, look for transaction patterns anywhere
+    if (tableStart == -1) {
+      print('No table structure found, trying pattern-based extraction...');
+      return _extractTransactionsWithPatterns(text, transactionPeriod);
+    }
 
-          String dateStr = dateMatch.group(0) ?? '';
-          DateTime date = _parseDate(dateStr);
+    // Parse transactions from the table
+    print('Found transaction table starting at line $tableStart');
 
-          // Extract amount - looking for RM pattern
-          Match? amountMatch = amountPattern.firstMatch(line);
-          if (amountMatch == null) continue;
+    // Process lines starting from the table
+    for (int i = tableStart; i < lines.length; i++) {
+      String line = lines[i];
 
-          String amountStr = amountMatch.group(0) ?? '';
-          double amount = double.tryParse(amountStr.replaceAll('RM', '')) ?? 0;
-
-          // Extract transaction type and status
-          // This is more complex and depends on the exact PDF format
-          String type = 'Unknown';
-          String status = 'Unknown';
-
-          // Try to extract from common patterns
-          if (line.contains('Transfer')) {
-            type = 'Transfer';
-          } else if (line.contains('Payment')) {
-            type = 'Payment';
-          } else if (line.contains('Reload')) {
-            type = 'Reload';
-          } else if (line.contains('QR')) {
-            type = 'QR Payment';
-          }
-
-          if (line.contains('Success')) {
-            status = 'Completed';
-          } else if (line.contains('Fail')) {
-            status = 'Failed';
-          } else if (line.contains('Pending')) {
-            status = 'Pending';
-          }
-
-          transactions.add(TransactionRecord(
-            date: date,
-            status: status,
-            type: type,
-            amount: amount,
-          ));
-        } catch (e) {
-          print('Error parsing line: $e');
-        }
+      // Skip empty lines and footers
+      if (line.isEmpty ||
+          line.toLowerCase().contains('system generated') ||
+          line.toLowerCase().contains('end of statement') ||
+          line.toLowerCase().contains('page ')) {
+        continue;
       }
-    } else {
-      // Try a more generic approach for unstructured text
-      bool inTransactionSection = false;
 
-      for (String line in lines) {
-        if (line.trim().isEmpty) continue;
+      // Look for lines starting with date pattern
+      RegExp dateRegex = RegExp(r'^(\d{1,2}/\d{1,2}/\d{4})');
+      var dateMatch = dateRegex.firstMatch(line);
 
-        // Check if line contains date and amount
-        if (datePattern.hasMatch(line) && amountPattern.hasMatch(line)) {
-          try {
-            Match? dateMatch = datePattern.firstMatch(line);
-            String dateStr = dateMatch?.group(0) ?? '';
-            DateTime date = _parseDate(dateStr);
+      if (dateMatch != null) {
+        // Found potential transaction, collect following lines too
+        List<String> transactionLines = [line];
 
-            Match? amountMatch = amountPattern.firstMatch(line);
-            String amountStr = amountMatch?.group(0) ?? '';
-            double amount = double.tryParse(amountStr.replaceAll('RM', '')) ?? 0;
-
-            String type;
-            if (line.toLowerCase().contains('transfer')) {
-              type = 'Transfer';
-            } else if (line.toLowerCase().contains('payment')) {
-              type = 'Payment';
-            } else if (line.toLowerCase().contains('reload')) {
-              type = 'Reload';
-            } else if (line.toLowerCase().contains('qr')) {
-              type = 'QR Payment';
-            } else {
-              type = 'Transaction';
-            }
-
-            String status;
-            if (line.toLowerCase().contains('success')) {
-              status = 'Completed';
-            } else if (line.toLowerCase().contains('fail')) {
-              status = 'Failed';
-            } else if (line.toLowerCase().contains('pending')) {
-              status = 'Pending';
-            } else {
-              status = 'Completed'; // Default
-            }
-
-            transactions.add(TransactionRecord(
-              date: date,
-              status: status,
-              type: type,
-              amount: amount,
-            ));
-          } catch (e) {
-            print('Error parsing line: $e');
+        // Collect next few lines that might be part of this transaction
+        for (int j = i + 1; j < math.min(i + 4, lines.length); j++) {
+          // Stop if we hit another date (new transaction)
+          if (RegExp(r'^\d{1,2}/\d{1,2}/\d{4}').hasMatch(lines[j])) {
+            break;
           }
+          // Stop if we hit empty line or known separators
+          if (lines[j].isEmpty || lines[j].toLowerCase().contains('---')) {
+            break;
+          }
+          transactionLines.add(lines[j]);
+        }
+
+        // Parse the complete transaction
+        var transaction = _parseTransactionFromLines(transactionLines);
+        if (transaction != null) {
+          transactions.add(transaction);
+          totalAmount += transaction['amount'] ?? 0.0;
+
+          String type = transaction['type'] ?? 'Unknown';
+          String status = transaction['status'] ?? 'Unknown';
+
+          transactionTypes[type] = (transactionTypes[type] ?? 0) + 1;
+          statusCount[status] = (statusCount[status] ?? 0) + 1;
+
+          print('Successfully parsed transaction: ${transaction}');
         }
       }
     }
 
-    return transactions;
+    // If still no transactions found, try more aggressive parsing
+    if (transactions.isEmpty) {
+      print('No transactions found in table, trying aggressive pattern matching...');
+      return _extractTransactionsWithPatterns(text, transactionPeriod);
+    }
+
+    print('=== ANALYSIS COMPLETE ===');
+    print('Found ${transactions.length} transactions');
+    print('Total amount: RM$totalAmount');
+
+    return {
+      'transactionPeriod': transactionPeriod ?? 'Not found',
+      'totalTransactions': transactions.length,
+      'totalAmount': totalAmount,
+      'transactionTypes': transactionTypes,
+      'statusCount': statusCount,
+      'transactions': transactions,
+      'averageAmount': transactions.isNotEmpty ? totalAmount / transactions.length : 0.0,
+    };
   }
 
-  // Enhanced date parsing function
-  DateTime _parseDate(String dateStr) {
-    // Clean the date string
-    dateStr = dateStr.trim();
+  // Find the start of transaction table by looking for headers or data patterns
+  int _findTransactionTable(List<String> lines) {
+    // Strategy 1: Look for table headers
+    for (int i = 0; i < lines.length; i++) {
+      String line = lines[i].toLowerCase();
 
-    // Try different date formats
-    List<String> formats = [
-      'dd/MM/yyyy',
-      'MM/dd/yyyy',
-      'yyyy/MM/dd',
-      'dd-MM-yyyy',
-      'MM-dd-yyyy',
-      'yyyy-MM-dd',
-      'd/M/yyyy',
-      'M/d/yyyy',
-      'yyyy/M/d',
-      'd-M-yyyy',
-      'M-d-yyyy',
-      'yyyy-M-d',
-    ];
-
-    // Try parsing with each format
-    for (String format in formats) {
-      try {
-        return DateFormat(format).parse(dateStr);
-      } catch (e) {
-        // Try next format
+      // Check if this line looks like a table header
+      if ((line.contains('date') && line.contains('status') && line.contains('transaction')) ||
+          (line.contains('date') && line.contains('amount')) ||
+          (line.contains('date') && line.contains('type'))) {
+        print('Found table header at line $i: ${lines[i]}');
+        return i + 1; // Return the line after header
       }
     }
 
-    // Try to extract date components manually
-    try {
-      List<String> parts = dateStr.split(RegExp(r'[/\-]'));
-      if (parts.length == 3) {
-        int? year, month, day;
+    // Strategy 2: Look for first transaction-like pattern
+    for (int i = 0; i < lines.length; i++) {
+      String line = lines[i];
 
-        // Try to determine which component is the year
-        if (parts[0].length == 4 || (int.tryParse(parts[0]) ?? 0) > 31) {
-          // Format is likely yyyy-MM-dd
-          year = int.tryParse(parts[0]);
-          month = int.tryParse(parts[1]);
-          day = int.tryParse(parts[2]);
-        } else if (parts[2].length == 4 || (int.tryParse(parts[2]) ?? 0) > 31) {
-          // Format is likely dd-MM-yyyy
-          day = int.tryParse(parts[0]);
-          month = int.tryParse(parts[1]);
-          year = int.tryParse(parts[2]);
+      // Check if line starts with date and contains success/amount pattern
+      if (RegExp(r'^\d{1,2}/\d{1,2}/\d{4}').hasMatch(line) &&
+          (line.toLowerCase().contains('success') || line.toLowerCase().contains('failed')) &&
+          line.contains('RM')) {
+        print('Found first transaction pattern at line $i: $line');
+        return i;
+      }
+    }
+
+    return -1;
+  }
+
+  // Parse transaction from collected lines
+  Map<String, dynamic>? _parseTransactionFromLines(List<String> transactionLines) {
+    if (transactionLines.isEmpty) return null;
+
+    // Combine all lines into one string for easier parsing
+    String fullText = transactionLines.join(' ').replaceAll(RegExp(r'\s+'), ' ');
+    print('Parsing transaction text: $fullText');
+
+    // Extract date (must be at the beginning)
+    RegExp dateRegex = RegExp(r'^(\d{1,2}/\d{1,2}/\d{4})');
+    var dateMatch = dateRegex.firstMatch(fullText);
+    if (dateMatch == null) return null;
+    String date = dateMatch.group(1)!;
+
+    // Extract status
+    String status = 'Unknown';
+    RegExp statusRegex = RegExp(r'\b(Success|Failed|Pending)\b', caseSensitive: false);
+    var statusMatch = statusRegex.firstMatch(fullText);
+    if (statusMatch != null) {
+      status = statusMatch.group(1)!;
+    }
+
+    // Extract transaction type with more specific patterns
+    String transactionType = 'Unknown';
+    Map<String, RegExp> typePatterns = {
+      'Payment': RegExp(r'\bPayment\b', caseSensitive: false),
+      'DuitNow QR TNGD': RegExp(r'DuitNow QR TNGD|DuitNow QR|DuitNow', caseSensitive: false),
+      'Receive from Wallet': RegExp(r'Receive from Wallet|Receive from', caseSensitive: false),
+      'Transfer to Wallet': RegExp(r'Transfer to Wallet|Transfer to', caseSensitive: false),
+      'Reload': RegExp(r'Top Up|Reload|Recharge', caseSensitive: false),
+      'Withdrawal': RegExp(r'Withdraw|Cash Out', caseSensitive: false),
+    };
+
+    for (var entry in typePatterns.entries) {
+      if (entry.value.hasMatch(fullText)) {
+        transactionType = entry.key;
+        break;
+      }
+    }
+
+    // Extract amount
+    RegExp amountRegex = RegExp(r'RM(\d+\.\d{2})');
+    var amountMatch = amountRegex.firstMatch(fullText);
+    if (amountMatch == null) return null;
+    double amount = double.parse(amountMatch.group(1)!);
+
+    // Extract description (look for known merchants or reference numbers)
+    String description = '';
+    List<String> merchants = ['SPEEDMART', 'MEETMEE', 'CHIN HUI LING', '99 SPEEDMART'];
+    for (String merchant in merchants) {
+      if (fullText.toUpperCase().contains(merchant)) {
+        description = merchant;
+        break;
+      }
+    }
+
+    // If no merchant found, try to extract reference/description
+    if (description.isEmpty) {
+      // Look for long number sequences that might be references
+      RegExp refRegex = RegExp(r'(\d{10,})');
+      var refMatch = refRegex.firstMatch(fullText);
+      if (refMatch != null) {
+        description = 'Ref: ${refMatch.group(1)!.substring(0, 8)}...';
+      }
+    }
+
+    return {
+      'date': date,
+      'status': status,
+      'type': transactionType,
+      'amount': amount,
+      'description': description,
+    };
+  }
+
+  // Fallback method using pattern matching across entire text
+  Map<String, dynamic> _extractTransactionsWithPatterns(String text, String? transactionPeriod) {
+    List<Map<String, dynamic>> transactions = [];
+
+    print('=== PATTERN-BASED EXTRACTION ===');
+
+    // Look for transaction patterns using regex
+    // This regex looks for: Date + Status + Type + Amount pattern
+    RegExp transactionRegex = RegExp(
+        r'(\d{1,2}/\d{1,2}/\d{4})\s+' + // Date
+            r'(Success|Failed|Pending)\s+' + // Status
+            r'([^RM]+?)' + // Transaction type and description (non-greedy)
+            r'RM(\d+\.\d{2})', // Amount
+        caseSensitive: false,
+        multiLine: true
+    );
+
+    var matches = transactionRegex.allMatches(text);
+
+    for (var match in matches) {
+      String date = match.group(1)!;
+      String status = match.group(2)!;
+      String typeAndDesc = match.group(3)!.trim();
+      double amount = double.parse(match.group(4)!);
+
+      // Extract transaction type from typeAndDesc
+      String transactionType = 'Unknown';
+      String description = '';
+
+      if (typeAndDesc.toUpperCase().contains('PAYMENT')) {
+        transactionType = 'Payment';
+        // Extract merchant name after Payment
+        RegExp merchantRegex = RegExp(r'Payment\s+(.+)', caseSensitive: false);
+        var merchantMatch = merchantRegex.firstMatch(typeAndDesc);
+        if (merchantMatch != null) {
+          description = merchantMatch.group(1)!.trim();
+        }
+      } else if (typeAndDesc.toUpperCase().contains('DUITNOW')) {
+        transactionType = 'DuitNow QR TNGD';
+        RegExp merchantRegex = RegExp(r'DuitNow QR TNGD\s+(.+)', caseSensitive: false);
+        var merchantMatch = merchantRegex.firstMatch(typeAndDesc);
+        if (merchantMatch != null) {
+          description = merchantMatch.group(1)!.trim();
+        }
+      } else if (typeAndDesc.toUpperCase().contains('RECEIVE')) {
+        transactionType = 'Receive from Wallet';
+        RegExp merchantRegex = RegExp(r'Receive from Wallet\s+(.+)', caseSensitive: false);
+        var merchantMatch = merchantRegex.firstMatch(typeAndDesc);
+        if (merchantMatch != null) {
+          description = merchantMatch.group(1)!.trim();
+        }
+      } else if (typeAndDesc.toUpperCase().contains('TRANSFER')) {
+        transactionType = 'Transfer to Wallet';
+      } else if (typeAndDesc.toUpperCase().contains('TOP UP') || typeAndDesc.toUpperCase().contains('RELOAD')) {
+        transactionType = 'Reload';
+      }
+
+      // Clean up description
+      if (description.isNotEmpty) {
+        // Extract merchant name or reference
+        List<String> merchants = ['SPEEDMART', 'MEETMEE', 'CHIN HUI LING'];
+        String upperDesc = description.toUpperCase();
+        for (String merchant in merchants) {
+          if (upperDesc.contains(merchant)) {
+            description = merchant;
+            break;
+          }
+        }
+      }
+
+      transactions.add({
+        'date': date,
+        'status': status,
+        'type': transactionType,
+        'amount': amount,
+        'description': description,
+      });
+
+      print('Pattern extracted: $date, $status, $transactionType, RM$amount, $description');
+    }
+
+    // Calculate totals
+    double totalAmount = 0.0;
+    Map<String, int> transactionTypes = {};
+    Map<String, int> statusCount = {};
+
+    for (var transaction in transactions) {
+      totalAmount += transaction['amount'];
+
+      String type = transaction['type'];
+      String status = transaction['status'];
+
+      transactionTypes[type] = (transactionTypes[type] ?? 0) + 1;
+      statusCount[status] = (statusCount[status] ?? 0) + 1;
+    }
+
+    return {
+      'transactionPeriod': transactionPeriod ?? 'Not found',
+      'totalTransactions': transactions.length,
+      'totalAmount': totalAmount,
+      'transactionTypes': transactionTypes,
+      'statusCount': statusCount,
+      'transactions': transactions,
+      'averageAmount': transactions.isNotEmpty ? totalAmount / transactions.length : 0.0,
+    };
+  }
+
+  // TNG Pattern matching fallback - simplified and focused
+  Map<String, dynamic> _parseTNGPatterns(String text) {
+    List<Map<String, dynamic>> transactions = [];
+
+    print('=== TNG PATTERN MATCHING FALLBACK ===');
+
+    // Split text by lines and look for transaction patterns
+    List<String> lines = text.split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+
+    // Look for transaction period in the text
+    String? transactionPeriod;
+    for (String line in lines) {
+      RegExp periodRegex = RegExp(r'(\d{1,2}\s+\w+\s+\d{4}\s*-\s*\d{1,2}\s+\w+\s+\d{4})');
+      var match = periodRegex.firstMatch(line);
+      if (match != null) {
+        transactionPeriod = match.group(1);
+        break;
+      }
+    }
+
+    // Process each line looking for transactions
+    for (int i = 0; i < lines.length; i++) {
+      String line = lines[i];
+      String fullTransaction = line;
+
+      // Combine with next few lines if they don't start with a date
+      for (int j = i + 1; j < math.min(i + 3, lines.length); j++) {
+        if (!RegExp(r'^\d{1,2}/\d{1,2}/\d{4}').hasMatch(lines[j])) {
+          fullTransaction += ' ' + lines[j];
         } else {
-          // Try to make a best guess based on typical ranges
-          List<int?> numParts = parts.map((p) => int.tryParse(p)).toList();
-
-          // If one part is > 31, it's likely the year (2-digit year)
-          if (numParts[0] != null && numParts[0]! > 31) {
-            year = numParts[0]! < 100 ? 2000 + numParts[0]! : numParts[0];
-            month = numParts[1];
-            day = numParts[2];
-          } else if (numParts[2] != null && numParts[2]! > 31) {
-            year = numParts[2]! < 100 ? 2000 + numParts[2]! : numParts[2];
-            day = numParts[0];
-            month = numParts[1];
-          } else {
-            // Best guess at MM/dd/yy or dd/MM/yy
-            // Prefer dd/MM/yyyy for Malaysian format
-            day = numParts[0];
-            month = numParts[1];
-            year = numParts[2] != null && numParts[2]! < 100 ? 2000 + numParts[2]! : numParts[2];
-          }
-        }
-
-        // Create date if all parts are valid
-        if (year != null && month != null && day != null) {
-          if (year < 100) year += 2000; // Assume 2-digit years are 20xx
-          if (month > 0 && month <= 12 && day > 0 && day <= 31) {
-            return DateTime(year, month, day);
-          }
+          break;
         }
       }
-    } catch (e) {
-      print('Manual date parsing failed: $e');
-    }
 
-    // Default to current date if parsing fails
-    print('Could not parse date: $dateStr, using current date');
-    return DateTime.now();
-  }
+      // Check if this line/block contains a transaction
+      RegExp transactionRegex = RegExp(
+          r'(\d{1,2}/\d{1,2}/\d{4})\s+(Success|Failed|Pending)\s+(Payment|DuitNow QR TNGD|Receive from Wallet|Transfer to Wallet|Top Up|Reload)',
+          caseSensitive: false
+      );
 
-  // Save transactions to Firestore
-  Future<void> _saveTransactionsToFirestore(List<TransactionRecord> transactions) async {
-    try {
-      final User? currentUser = FirebaseAuth.instance.currentUser;
+      var match = transactionRegex.firstMatch(fullTransaction);
+      if (match != null) {
+        String date = match.group(1)!;
+        String status = match.group(2)!;
+        String type = match.group(3)!;
 
-      if (currentUser != null && transactions.isNotEmpty) {
-        // Add each transaction to Firestore
-        for (var transaction in transactions) {
-          await _firestore
-              .collection('users')
-              .doc(currentUser.uid)
-              .collection('transactions')
-              .add(transaction.toMap());
+        // Extract amounts
+        RegExp amountRegex = RegExp(r'RM(\d+\.\d{2})');
+        var amountMatches = amountRegex.allMatches(fullTransaction);
+
+        if (amountMatches.isNotEmpty) {
+          double amount = double.parse(amountMatches.first.group(1)!);
+
+          // Extract description (merchant names)
+          String description = '';
+          List<String> merchants = ['SPEEDMART', 'MEETMEE', 'CHIN HUI LING'];
+          for (String merchant in merchants) {
+            if (fullTransaction.toUpperCase().contains(merchant)) {
+              description = merchant;
+              break;
+            }
+          }
+
+          transactions.add({
+            'date': date,
+            'status': status,
+            'type': type == 'Top Up' ? 'Reload' : type, // Standardize Top Up to Reload
+            'amount': amount,
+            'description': description,
+          });
+
+          print('Pattern matched transaction: $date, $status, $type, RM$amount');
         }
-
-        // Also save metadata about this batch
-        await _firestore
-            .collection('users')
-            .doc(currentUser.uid)
-            .collection('transaction_uploads')
-            .add({
-          'timestamp': Timestamp.now(),
-          'count': transactions.length,
-          'source': 'file_upload',
-        });
       }
-    } catch (e) {
-      print('Error saving transactions: $e');
-      throw e;
     }
+
+    // Calculate summary
+    double totalAmount = 0.0;
+    Map<String, int> transactionTypes = {};
+    Map<String, int> statusCount = {};
+
+    for (var transaction in transactions) {
+      totalAmount += transaction['amount'];
+
+      String type = transaction['type'];
+      String status = transaction['status'];
+
+      transactionTypes[type] = (transactionTypes[type] ?? 0) + 1;
+      statusCount[status] = (statusCount[status] ?? 0) + 1;
+    }
+
+    return {
+      'transactionPeriod': transactionPeriod ?? 'Not found',
+      'totalTransactions': transactions.length,
+      'totalAmount': totalAmount,
+      'transactionTypes': transactionTypes,
+      'statusCount': statusCount,
+      'transactions': transactions,
+      'averageAmount': transactions.isNotEmpty ? totalAmount / transactions.length : 0.0,
+    };
   }
 
-  // Show dialog to get PDF password (for protected PDFs)
-  Future<String?> _showPDFPasswordInputDialog() async {
-    String? password;
-
-    await showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('PDF Password'),
-          content: TextField(
-            obscureText: true,
-            decoration: const InputDecoration(
-              hintText: 'Enter PDF password',
-              border: OutlineInputBorder(),
-            ),
-            onChanged: (value) {
-              password = value;
-            },
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                password = null;
-              },
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-              },
-              child: const Text('OK'),
-            ),
-          ],
-        );
-      },
-    );
-
-    return password;
-  }
-
-  // Method to show a dialog asking if the PDF is password protected
-  Future<bool> _showPasswordProtectionDialog(
-      BuildContext context,
-      String fileName,
-      ) async {
-    bool isPasswordProtected = false;
-
-    await showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('PDF Protection'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [Text('Is "$fileName" password protected?')],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              isPasswordProtected = false;
-              Navigator.of(context).pop();
-            },
-            child: const Text('No'),
-          ),
-          TextButton(
-            onPressed: () {
-              isPasswordProtected = true;
-              Navigator.of(context).pop();
-            },
-            child: const Text('Yes'),
-          ),
-        ],
-      ),
-    );
-
-    return isPasswordProtected;
-  }
-
-  void _showFileDetails(FirebaseFileInfo fileInfo) async {
-    // Show loading indicator
-    setState(() {
-      isLoading = true;
+  Future<void> _saveAnalysisResult(String fileId, Map<String, dynamic> analysisResult) async {
+    await _firestore
+        .collection('users')
+        .doc(_currentUser!.uid)
+        .collection('uploaded_files')
+        .doc(fileId)
+        .update({
+      'analysisResult': analysisResult,
+      'analyzedAt': Timestamp.now(),
     });
 
-    try {
-      // Download the file
-      final fileBytes = await _fileService.downloadFile(fileInfo.id);
-
-      // Save to temporary file for viewing
-      final tempPath = await _fileService.saveFileToDisk(fileBytes, fileInfo.name);
-
-      setState(() {
-        isLoading = false;
-      });
-
-      // Navigate to file details page
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (context) => FirebaseFileDetailPage(
-            fileInfo: fileInfo,
-            filePath: tempPath,
-            onDelete: _deleteFile,
-            onAnalyze: _analyzeExistingFile,
-          ),
-        ),
-      );
-    } catch (e) {
-      print('Error downloading file: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error opening file: $e')),
-      );
-      setState(() {
-        isLoading = false;
-      });
-    }
+    await _loadUploadedFiles();
   }
 
-  // Method to analyze an existing file
-  Future<void> _analyzeExistingFile(FirebaseFileInfo fileInfo, String filePath) async {
-    setState(() {
-      isProcessing = true;
-    });
-
-    try {
-      // Get file extension
-      final fileExtension = fileInfo.fileExtension.toLowerCase();
-
-      // Extract transactions from the file
-      final file = File(filePath);
-      final transactions = await _extractTransactionsFromFile(
-          file,
-          fileExtension,
-          fileInfo.isPasswordProtected
-      );
-
-      if (transactions.isNotEmpty) {
-        await _saveTransactionsToFirestore(transactions);
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('${transactions.length} transactions extracted and saved')),
-        );
-
-        // Navigate to report page to see the transactions
-        Navigator.of(context).pushNamed('/report');
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No transactions found in the file')),
-        );
-      }
-    } catch (e) {
-      print('Error analyzing file: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error analyzing file: $e')),
-      );
-    } finally {
-      setState(() {
-        isProcessing = false;
-      });
-    }
-  }
-
-  void _deleteFile(FirebaseFileInfo fileInfo) async {
-    try {
-      await _fileService.deleteFile(fileInfo.id);
-      await _loadFiles();
-    } catch (e) {
-      print('Error deleting file: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error deleting file: $e')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.grey[100],
-      appBar: AppBar(
-        backgroundColor: Colors.grey[100],
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.black),
-          onPressed: () {
-            // Handle back navigation
-            Navigator.of(context).pop();
-          },
-        ),
-        title: const Text(
-          'Upload File',
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-        ),
-        actions: [
-          // Navigate to report page
-          IconButton(
-            icon: const Icon(Icons.bar_chart, color: Colors.black),
-            onPressed: () {
-              Navigator.of(context).pushNamed('/report');
-            },
-            tooltip: 'View Financial Report',
-          ),
-          // Sign out button
-          IconButton(
-            icon: const Icon(Icons.logout, color: Colors.black),
-            onPressed: () async {
-              await FirebaseAuth.instance.signOut();
-              Navigator.pushReplacementNamed(context, '/login');
-            },
-          ),
-        ],
-        centerTitle: true,
-      ),
-      body: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 24.0),
-        child: isLoading
-            ? const Center(child: CircularProgressIndicator())
-            : Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Upload Area
-            GestureDetector(
-              onTap: _pickFile,
-              child: DottedBorder(
-                borderType: BorderType.RRect,
-                radius: const Radius.circular(8),
-                color: Colors.black,
-                strokeWidth: 1,
-                dashPattern: const [5, 5],
-                child: Container(
-                  width: double.infinity,
-                  height: 180,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(
-                          Icons.cloud_upload_outlined,
-                          size: 50,
-                          color: Colors.black,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          isProcessing
-                              ? 'Processing transactions...'
-                              : 'Upload transaction file',
-                          style: TextStyle(
-                            fontSize: 16,
-                            color: Colors.black,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          'Supported formats: PDF, CSV, Excel',
-                          style: TextStyle(fontSize: 12, color: Colors.grey),
-                        ),
-                        if (isProcessing)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 12.0),
-                            child: SizedBox(
-                              width: 24,
-                              height: 24,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                valueColor: AlwaysStoppedAnimation<Color>(Colors.amber),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 40),
-
-            // Always show the "Recent Uploaded File" section
-            Container(
-              alignment: Alignment.centerRight,
-              child: Column(
-                children: [
-                  const Text(
-                    'Recent Uploaded Files',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                  Container(
-                    height: 1,
-                    width: 180,
-                    color: Colors.black,
-                    margin: const EdgeInsets.only(top: 2),
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 16),
-
-            // List of uploaded files (if any)
-            if (uploadedFiles.isNotEmpty)
-              Expanded(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: uploadedFiles.length,
-                  itemBuilder: (context, index) {
-                    final fileInfo = uploadedFiles[index];
-                    // Determine file type icon based on extension
-                    final fileExtension = fileInfo.fileExtension.toLowerCase();
-                    final isImage = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'].contains(fileExtension);
-                    final isPdf = fileExtension == 'pdf';
-                    final isDoc = ['doc', 'docx', 'txt', 'rtf'].contains(fileExtension);
-                    final isSpreadsheet = ['xls', 'xlsx', 'csv'].contains(fileExtension);
-
-                    IconData fileIcon;
-                    Color iconColor;
-
-                    if (isImage) {
-                      fileIcon = Icons.image;
-                      iconColor = Colors.blue;
-                    } else if (isPdf) {
-                      fileIcon = Icons.picture_as_pdf;
-                      iconColor = Colors.red;
-                    } else if (isDoc) {
-                      fileIcon = Icons.description;
-                      iconColor = Colors.indigo;
-                    } else if (isSpreadsheet) {
-                      fileIcon = Icons.table_chart;
-                      iconColor = Colors.green;
-                    } else {
-                      fileIcon = Icons.insert_drive_file;
-                      iconColor = Colors.grey;
-                    }
-
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: ListTile(
-                        leading: Icon(
-                          fileIcon,
-                          color: iconColor,
-                        ),
-                        title: Text(fileInfo.name),
-                        subtitle: Text(
-                          fileInfo.formattedSize,
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (fileInfo.isPasswordProtected)
-                              const Icon(
-                                Icons.lock,
-                                size: 16,
-                                color: Colors.orange,
-                              ),
-                            const SizedBox(width: 8),
-                            const Icon(Icons.arrow_forward_ios, size: 16),
-                          ],
-                        ),
-                        onTap: () {
-                          // Show file details when tapped
-                          _showFileDetails(fileInfo);
-                        },
-                      ),
-                    );
-                  },
-                ),
-              ),
-
-            if (uploadedFiles.isEmpty)
-              const Expanded(
-                child: Center(
-                  child: Text(
-                    "No files uploaded yet",
-                    style: TextStyle(color: Colors.grey, fontSize: 16),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// File Details Page for Firebase files
-class FirebaseFileDetailPage extends StatefulWidget {
-  final FirebaseFileInfo fileInfo;
-  final String filePath;
-  final Function(FirebaseFileInfo) onDelete;
-  final Function(FirebaseFileInfo, String) onAnalyze;
-
-  const FirebaseFileDetailPage({
-    Key? key,
-    required this.fileInfo,
-    required this.filePath,
-    required this.onDelete,
-    required this.onAnalyze,
-  }) : super(key: key);
-
-  @override
-  _FirebaseFileDetailPageState createState() => _FirebaseFileDetailPageState();
-}
-
-class _FirebaseFileDetailPageState extends State<FirebaseFileDetailPage> {
-  bool isLoading = false;
-  bool isAnalyzing = false;
-  Uint8List? filePreview;
-  String? pdfPassword; // Store PDF password if provided
-
-  @override
-  void initState() {
-    super.initState();
-    _loadFilePreview();
-  }
-
-  Future<void> _loadFilePreview() async {
-    // List of common image file extensions
-    final imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-
-    if (imageExtensions.contains(widget.fileInfo.fileExtension.toLowerCase())) {
-      setState(() {
-        isLoading = true;
-      });
-
-      try {
-        // Load the file as bytes for preview
-        final file = File(widget.filePath);
-        final bytes = await file.readAsBytes();
-
-        setState(() {
-          filePreview = bytes;
-          isLoading = false;
-        });
-      } catch (e) {
-        print('Error loading preview: $e');
-        setState(() {
-          isLoading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _openFile() async {
-    try {
-      final extension = widget.fileInfo.fileExtension.toLowerCase();
-      final imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-
-      if (imageExtensions.contains(extension) && filePreview != null) {
-        // Image viewer is built into the UI
-        showDialog(
-          context: context,
-          builder: (context) => Dialog(
-            child: Container(
-              constraints: const BoxConstraints(
-                maxWidth: double.infinity,
-                maxHeight: 500,
-              ),
-              child: Image.memory(filePreview!, fit: BoxFit.contain),
-            ),
-          ),
-        );
-      } else if (extension == 'pdf') {
-        // For PDF files with password protection
-        if (widget.fileInfo.isPasswordProtected) {
-          if (pdfPassword == null) {
-            // If password isn't set, prompt for it
-            _showPdfPasswordDialog(context);
-            return;
-          }
-
-          // If we have a password, use it to open the PDF directly
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (context) => PDFViewPage(
-                filePath: widget.filePath,
-                password: pdfPassword,
-              ),
-            ),
-          );
-        } else {
-          // For non-password protected PDFs
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (context) => PDFViewPage(
-                filePath: widget.filePath,
-              ),
-            ),
-          );
-        }
-      } else {
-        // For other file types, use OpenFile
-        final result = await OpenFile.open(widget.filePath);
-        if (result.type != ResultType.done) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Error: ${result.message}')),
-          );
-        }
-      }
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
-    }
-  }
-
-  // Method to show PDF password dialog
-  void _showPdfPasswordDialog(BuildContext context) {
-    final TextEditingController passwordController = TextEditingController();
-
+  // Enhanced error dialog with debug information
+  void _showDetailedErrorDialog(String title, String message, Map<String, dynamic> debugData) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('PDF Password'),
+        title: Row(
+          children: [
+            Icon(Icons.error_outline, color: Colors.red),
+            SizedBox(width: 8),
+            Expanded(child: Text(title)),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(message),
+              SizedBox(height: 16),
+
+              // Show debug information if available
+              if (debugData.containsKey('debugInfo')) ...[
+                Text('Debug Information:', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+
+                if (debugData['debugInfo']['totalPages'] != null)
+                  Text('• Total pages: ${debugData['debugInfo']['totalPages']}'),
+
+                if (debugData['debugInfo']['totalTextLength'] != null)
+                  Text('• Text extracted: ${debugData['debugInfo']['totalTextLength']} characters'),
+
+                SizedBox(height: 16),
+              ],
+
+              Text('Troubleshooting Tips:', style: TextStyle(fontWeight: FontWeight.bold)),
+              SizedBox(height: 8),
+              Text('• Make sure your file contains transaction data\n'
+                  '• Check if the file has headers like Date, Status, Transaction Type, Amount\n'
+                  '• Try uploading a different file format if available\n'
+                  '• Contact support if the issue persists'),
+
+              // Show raw text preview if available
+              if (debugData.containsKey('rawText') && debugData['rawText'] != null) ...[
+                SizedBox(height: 16),
+                Text('File Preview:', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Container(
+                  height: 200,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Padding(
+                      padding: EdgeInsets.all(8),
+                      child: Text(
+                        debugData['rawText'],
+                        style: TextStyle(fontFamily: 'monospace', fontSize: 12),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+
+              SizedBox(height: 16),
+              Container(
+                padding: EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blue[50],
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.info, color: Colors.blue, size: 16),
+                        SizedBox(width: 8),
+                        Text('TNG Wallet File Format', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                      ],
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'For best results, ensure your TNG Wallet statement contains:\n'
+                          '• Transaction table with Date, Status, Type, Amount columns\n'
+                          '• Proper CSV or Excel formatting maintained',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Close'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _exportDebugInfo(debugData);
+            },
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFC700),
+            ),
+            child: Text('Export Debug Info'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _exportDebugInfo(Map<String, dynamic> debugData) {
+    print('=== EXPORTED DEBUG INFO ===');
+    print(debugData.toString());
+    _showSuccessSnackBar('Debug information logged to console');
+  }
+
+  void _showAnalysisResult(Map<String, dynamic> result) {
+    if (result.containsKey('totalTransactions')) {
+      _showTransactionAnalysisResult(result);
+    } else if (result.containsKey('fileType')) {
+      _showGeneralFileAnalysisResult(result);
+    } else {
+      _showGenericAnalysisResult(result);
+    }
+  }
+
+  void _showTransactionAnalysisResult(Map<String, dynamic> result) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Transaction Analysis'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnalysisRow('Transaction Period', result['transactionPeriod']),
+                _buildAnalysisRow('Total Transactions', '${result['totalTransactions']}'),
+                _buildAnalysisRow('Total Amount', 'RM${result['totalAmount'].toStringAsFixed(2)}'),
+                _buildAnalysisRow('Average Amount', 'RM${result['averageAmount'].toStringAsFixed(2)}'),
+                const SizedBox(height: 16),
+
+                if ((result['transactionTypes'] as Map<String, dynamic>).isNotEmpty) ...[
+                  const Text('Transaction Types:',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 8),
+                  ...((result['transactionTypes'] as Map<String, dynamic>).entries
+                      .map<Widget>((e) => Padding(
+                    padding: const EdgeInsets.only(left: 16, bottom: 4),
+                    child: Text('• ${e.key}: ${e.value}'),
+                  ))
+                      .toList()),
+                ] else ...[
+                  const Text('Transaction Types: None identified',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                ],
+
+                const SizedBox(height: 16),
+
+                if ((result['statusCount'] as Map<String, dynamic>).isNotEmpty) ...[
+                  const Text('Status Distribution:',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 8),
+                  ...((result['statusCount'] as Map<String, dynamic>).entries
+                      .map<Widget>((e) => Padding(
+                    padding: const EdgeInsets.only(left: 16, bottom: 4),
+                    child: Text('• ${e.key}: ${e.value}'),
+                  ))
+                      .toList()),
+                ] else ...[
+                  const Text('Status Distribution: None identified',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                ],
+
+                if ((result['transactions'] as List).isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  const Text('Sample Transactions:',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 8),
+                  ...(result['transactions'] as List).take(3).map<Widget>((transaction) =>
+                      Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        color: Colors.grey[50],
+                        child: Padding(
+                          padding: const EdgeInsets.all(8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Date: ${transaction['date'] ?? 'Unknown'}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold)),
+                              if (transaction['type'] != null && transaction['type'].toString().isNotEmpty)
+                                Text('Type: ${transaction['type']}'),
+                              if (transaction['status'] != null && transaction['status'].toString().isNotEmpty)
+                                Text('Status: ${transaction['status']}'),
+                              Text('Amount: RM${transaction['amount']?.toStringAsFixed(2) ?? '0.00'}'),
+                              if (transaction['balance'] != null && transaction['balance'] > 0)
+                                Text('Balance: RM${transaction['balance'].toStringAsFixed(2)}'),
+                              if (transaction['description'] != null && transaction['description'].toString().isNotEmpty)
+                                Text('Description: ${transaction['description']}'),
+                            ],
+                          ),
+                        ),
+                      )
+                  ).toList(),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFC700),
+            ),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showGeneralFileAnalysisResult(Map<String, dynamic> result) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text('${result['fileType']} Analysis'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnalysisRow('File Type', result['fileType']),
+                if (result['textLength'] != null)
+                  _buildAnalysisRow('Text Length', '${result['textLength']} characters'),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFC700),
+            ),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showGenericAnalysisResult(Map<String, dynamic> result) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('File Analysis'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Analysis completed. See details below:',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+
+              ...result.entries.map((entry) {
+                if (entry.value is Map || entry.value is List) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('${entry.key}:', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        width: double.infinity,
+                        decoration: BoxDecoration(
+                          color: Colors.grey[100],
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(_formatComplexValue(entry.value)),
+                      ),
+                      const SizedBox(height: 8),
+                    ],
+                  );
+                } else {
+                  return _buildAnalysisRow(entry.key, entry.value?.toString() ?? 'N/A');
+                }
+              }).toList(),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFC700),
+            ),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatComplexValue(dynamic value) {
+    if (value is Map) {
+      return value.entries
+          .map((e) => '${e.key}: ${e.value.toString()}')
+          .join('\n');
+    } else if (value is List) {
+      if (value.isEmpty) return '(empty)';
+      return value.map((item) => '- $item').join('\n');
+    }
+    return value.toString();
+  }
+
+  Widget _buildAnalysisRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('$label: ', style: const TextStyle(fontWeight: FontWeight.bold)),
+          Expanded(child: Text(value)),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _deleteFile(Map<String, dynamic> fileData) async {
+    try {
+      if (fileData['localPath'] != null) {
+        File localFile = File(fileData['localPath']);
+        if (await localFile.exists()) {
+          await localFile.delete();
+        }
+      }
+
+      await _firestore
+          .collection('users')
+          .doc(_currentUser!.uid)
+          .collection('uploaded_files')
+          .doc(fileData['id'])
+          .delete();
+
+      await _loadUploadedFiles();
+
+      if (mounted) {
+        _showSuccessSnackBar('File "${fileData['name']}" deleted successfully!');
+      }
+    } catch (e) {
+      print('Delete error: $e');
+      if (mounted) {
+        _showErrorSnackBar('Failed to delete file: ${e.toString()}');
+      }
+    }
+  }
+
+  void _showFileDetails(Map<String, dynamic> fileData) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(fileData['name']),
         content: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'This PDF is password-protected. Please enter the password:',
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: passwordController,
-              decoration: const InputDecoration(
-                labelText: 'PDF Password',
-                border: OutlineInputBorder(),
+            Text('Size: ${_formatFileSize(fileData['size'])}'),
+            Text('Type: ${fileData['type']?.toUpperCase() ?? 'Unknown'}'),
+            Text('Uploaded: ${_formatDate(fileData['uploadedAt'])}'),
+            if (fileData['analyzedAt'] != null)
+              Text('Analyzed: ${_formatDate(fileData['analyzedAt'])}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+          if (fileData['analysisResult'] != null)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _showAnalysisResult(fileData['analysisResult']);
+              },
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFFFFC700),
               ),
-              obscureText: true,
+              child: const Text('View Analysis'),
+            ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _openFile(fileData);
+            },
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFC700),
+            ),
+            child: const Text('Open File'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openFile(Map<String, dynamic> fileData) async {
+    try {
+      if (fileData['localPath'] != null) {
+        File file = File(fileData['localPath']);
+        if (await file.exists()) {
+          await OpenFile.open(fileData['localPath']);
+        } else {
+          _showErrorSnackBar('File not found');
+        }
+      }
+    } catch (e) {
+      print('Error opening file: $e');
+      _showErrorSnackBar('Error opening file: $e');
+    }
+  }
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  String _formatDate(dynamic timestamp) {
+    DateTime date;
+    if (timestamp is Timestamp) {
+      date = timestamp.toDate();
+    } else if (timestamp is DateTime) {
+      date = timestamp;
+    } else {
+      return 'Unknown';
+    }
+    return DateFormat('MMM dd, yyyy').format(date);
+  }
+
+  void _showSuccessSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: Colors.green,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.error, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  void _showPdfErrorDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.error_outline, color: Colors.red),
+            SizedBox(width: 8),
+            Expanded(child: Text('Unsupported File Format')),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('PDF files are no longer supported in this version of the application.'),
+            SizedBox(height: 16),
+            Text('Please upload one of the following file formats:',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('• CSV files (.csv)'),
+                  Text('• Excel files (.xlsx)'),
+                ],
+              ),
+            ),
+            SizedBox(height: 16),
+            Container(
+              padding: EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue[50],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info, color: Colors.blue, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'If you have a PDF statement, please export it to CSV or Excel format before uploading.',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ],
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              setState(() {
-                pdfPassword = passwordController.text;
-              });
-              Navigator.of(context).pop();
-
-              // Try opening with the provided password
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => PDFViewPage(
-                    filePath: widget.filePath,
-                    password: pdfPassword,
-                  ),
-                ),
-              );
-            },
-            child: const Text('Open PDF'),
+            onPressed: () => Navigator.pop(context),
+            child: Text('OK'),
           ),
         ],
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
     );
-  }
-
-  // Method to analyze the file for transactions with debugging
-  Future<void> _analyzeFile() async {
-    setState(() {
-      isAnalyzing = true;
-    });
-
-    try {
-      // Get file extension
-      final fileExtension = widget.fileInfo.fileExtension.toLowerCase();
-      final isPdf = fileExtension == 'pdf';
-
-      // Show progress message
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Analyzing file...')),
-      );
-
-      // Add debugging message to console
-      print('Starting analysis of ${widget.fileInfo.name}');
-      print('File type: $fileExtension, Password protected: ${widget.fileInfo.isPasswordProtected}');
-
-      // Extract transactions from the file
-      final file = File(widget.filePath);
-      final transactions = await widget.onAnalyze(widget.fileInfo, widget.filePath);
-
-      // Check if transactions were found
-      if (transactions != null && transactions.isNotEmpty) {
-        // Navigate to report page to see the transactions
-        Navigator.of(context).pushNamed('/report', arguments: 'just_uploaded');
-      } else {
-        // If no transactions found, provide a more detailed error message
-        if (isPdf) {
-          // For PDFs, offer potential solutions
-          showDialog(
-            context: context,
-            builder: (context) => AlertDialog(
-              title: const Text('No Transactions Found'),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: const [
-                  Text('Could not find any transactions in this PDF file.'),
-                  SizedBox(height: 16),
-                  Text('Possible reasons:'),
-                  SizedBox(height: 8),
-                  Text('• The PDF may be scanned images rather than text'),
-                  Text('• The transaction format is not recognized'),
-                  Text('• The PDF may be encrypted or protected'),
-                  SizedBox(height: 16),
-                  Text('Would you like to try again with different settings?'),
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cancel'),
-                ),
-                TextButton(
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                    // You could add alternative extraction options here
-                  },
-                  child: const Text('Try Different Method'),
-                ),
-              ],
-            ),
-          );
-        } else {
-          // For other file types
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('No transactions found in the file. Try another file format.'),
-              duration: Duration(seconds: 5),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      print('Error analyzing file: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error analyzing file: $e'),
-          duration: const Duration(seconds: 5),
-        ),
-      );
-    } finally {
-      setState(() {
-        isAnalyzing = false;
-      });
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.grey[100],
+      backgroundColor: const Color(0xFFF8F8F8),
       appBar: AppBar(
-        backgroundColor: Colors.grey[100],
+        backgroundColor: Colors.white,
         elevation: 0,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.black),
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
+          onPressed: () => Navigator.pop(context),
         ),
         title: const Text(
-          'File Details',
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+          'Upload File',
+          style: TextStyle(
+            color: Colors.black,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
         ),
         centerTitle: true,
       ),
-      body: isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildFilePreview(),
-            const SizedBox(height: 24),
-            _buildDetailItem(context, 'File Name', widget.fileInfo.name),
-            _buildDetailItem(
-              context,
-              'File Type',
-              widget.fileInfo.fileExtension.toUpperCase(),
-            ),
-            _buildDetailItem(
-              context,
-              'File Size',
-              widget.fileInfo.formattedSize,
-            ),
-            _buildDetailItem(
-              context,
-              'Date Added',
-              widget.fileInfo.formattedDate,
-            ),
-            _buildDetailItem(
-              context,
-              'Encrypted',
-              widget.fileInfo.isEncrypted ? 'Yes' : 'No',
-            ),
-            _buildDetailItem(
-              context,
-              'Password Protected',
-              widget.fileInfo.isPasswordProtected ? 'Yes' : 'No',
-            ),
-            _buildDetailItem(
-              context,
-              'Cloud Storage',
-              'Yes (Firebase)',
-            ),
-            if (pdfPassword != null && widget.fileInfo.isPasswordProtected)
-              _buildDetailItem(context, 'PDF Password', '••••••••'),
-            const SizedBox(height: 32),
-            _buildActionButtons(context),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFilePreview() {
-    final imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-
-    if (filePreview != null &&
-        imageExtensions.contains(widget.fileInfo.fileExtension.toLowerCase())) {
-      // If we have image preview data, show it
-      return Container(
-        height: 200,
-        width: double.infinity,
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
-          color: Colors.grey[200],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Image.memory(filePreview!, fit: BoxFit.contain),
-        ),
-      );
-    }
-
-    // Otherwise show the file icon
-    IconData iconData;
-    Color iconColor;
-
-    final extension = widget.fileInfo.fileExtension.toLowerCase();
-
-    if (imageExtensions.contains(extension)) {
-      iconData = Icons.image;
-      iconColor = Colors.blue;
-    } else if (['pdf'].contains(extension)) {
-      iconData = Icons.picture_as_pdf;
-      iconColor = Colors.red;
-    } else if (['doc', 'docx', 'txt', 'rtf'].contains(extension)) {
-      iconData = Icons.description;
-      iconColor = Colors.indigo;
-    } else if (['xls', 'xlsx', 'csv'].contains(extension)) {
-      iconData = Icons.table_chart;
-      iconColor = Colors.green;
-    } else {
-      iconData = Icons.insert_drive_file;
-      iconColor = Colors.grey;
-    }
-
-    return Center(
-      child: Column(
+      body: Column(
         children: [
-          Stack(
-            alignment: Alignment.center,
-            children: [
-              Icon(iconData, size: 80, color: iconColor),
-              if (isLoading) const CircularProgressIndicator(),
-              if (widget.fileInfo.isEncrypted ||
-                  widget.fileInfo.isPasswordProtected)
-                Positioned(
-                  bottom: 0,
-                  right: 0,
-                  child: Container(
-                    padding: const EdgeInsets.all(4),
-                    decoration: const BoxDecoration(
-                      color: Colors.black,
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      Icons.lock,
-                      color: Colors.white,
-                      size: 16,
-                    ),
+          const SizedBox(height: 24),
+          // Upload area with dotted border
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: GestureDetector(
+              onTap: _isUploading ? null : _pickAndUploadFile,
+              child: DottedBorder(
+                color: Colors.grey.shade400,
+                strokeWidth: 2,
+                dashPattern: const [8, 4],
+                borderType: BorderType.RRect,
+                radius: const Radius.circular(12),
+                child: Container(
+                  width: double.infinity,
+                  height: 200,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF8F8F8),
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            widget.fileInfo.name,
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDetailItem(BuildContext context, String title, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 150,
-            child: Text(
-              title,
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Colors.grey,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(fontWeight: FontWeight.w500),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildActionButtons(BuildContext context) {
-    final isPdf = widget.fileInfo.fileExtension.toLowerCase() == 'pdf';
-    final isCsv = widget.fileInfo.fileExtension.toLowerCase() == 'csv';
-    final isExcel = ['xls', 'xlsx'].contains(widget.fileInfo.fileExtension.toLowerCase());
-    final canAnalyze = isPdf || isCsv || isExcel;
-
-    return Column(
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.open_in_new),
-                label: const Text('Open File'),
-                style: ElevatedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  backgroundColor: Colors.blue,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                ),
-                onPressed: isLoading ? null : _openFile,
-              ),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: OutlinedButton.icon(
-                icon: const Icon(Icons.delete_outline),
-                label: const Text('Delete'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.red,
-                  side: const BorderSide(color: Colors.red),
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                ),
-                onPressed: () {
-                  // Show delete confirmation dialog
-                  showDialog(
-                    context: context,
-                    builder: (context) => AlertDialog(
-                      title: const Text('Delete File'),
-                      content: Text(
-                        'Are you sure you want to delete ${widget.fileInfo.name}? This will remove it from Firebase.',
-                      ),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.of(context).pop(),
-                          child: const Text('Cancel'),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (_isUploading)
+                        const CircularProgressIndicator(
+                          color: Color(0xFFFFC700),
+                          strokeWidth: 3,
+                        )
+                      else
+                        Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(50),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.1),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: const Icon(
+                            Icons.cloud_upload_outlined,
+                            size: 48,
+                            color: Colors.black87,
+                          ),
                         ),
-                        TextButton(
-                          onPressed: () {
-                            widget.onDelete(widget.fileInfo);
-                            Navigator.of(context).pop();
-                            Navigator.of(context).pop();
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('File deleted Successfully')),
-                            );
-                          },
-                          child: const Text(
-                            'Delete',
-                            style: TextStyle(color: Colors.red),
+                      const SizedBox(height: 16),
+                      Text(
+                        _isUploading ? 'Uploading...' : 'Upload your file here',
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: Colors.grey.shade700,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (!_isUploading) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Supported formats: CSV, XLSX',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey.shade500,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'PDF files are not supported',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.red.shade400,
+                            fontWeight: FontWeight.w500,
                           ),
                         ),
                       ],
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-
-        // Add analyze button if file can be analyzed
-        if (canAnalyze)
-          Padding(
-            padding: const EdgeInsets.only(top: 12.0),
-            child: SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                icon: isAnalyzing
-                    ? SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                    ],
                   ),
-                )
-                    : const Icon(Icons.bar_chart),
-                label: Text(isAnalyzing ? 'Analyzing...' : 'Analyze Transactions'),
-                style: ElevatedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  backgroundColor: Colors.amber,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
                 ),
-                onPressed: isAnalyzing ? null : _analyzeFile,
               ),
             ),
           ),
-      ],
+          const SizedBox(height: 48),
+
+          // Recent uploaded files section
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Row(
+              children: [
+                Text(
+                  'Recent Uploaded File',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.grey.shade800,
+                    decoration: TextDecoration.underline,
+                    decorationThickness: 2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // File list
+          Expanded(
+            child: _uploadedFiles.isEmpty
+                ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    Icons.folder_open,
+                    size: 64,
+                    color: Colors.grey.shade400,
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'No files uploaded yet',
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: Colors.grey.shade500,
+                    ),
+                  ),
+                ],
+              ),
+            )
+                : ListView.builder(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              itemCount: _uploadedFiles.length,
+              itemBuilder: (context, index) {
+                final file = _uploadedFiles[index];
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.05),
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    leading: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFC700).withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Icon(
+                        file['type'] == 'csv'
+                            ? Icons.table_chart
+                            : Icons.description,
+                        color: const Color(0xFFFFC700),
+                        size: 24,
+                      ),
+                    ),
+                    title: Text(
+                      file['name'],
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 16,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            Text(
+                              _formatFileSize(file['size']),
+                              style: TextStyle(
+                                color: Colors.grey.shade600,
+                                fontSize: 14,
+                              ),
+                            ),
+                            Text(
+                              ' • ',
+                              style: TextStyle(
+                                color: Colors.grey.shade600,
+                              ),
+                            ),
+                            Text(
+                              _formatDate(file['uploadedAt']),
+                              style: TextStyle(
+                                color: Colors.grey.shade600,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            if (file['analysisResult'] != null)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.shade100,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Text(
+                                  'Analyzed',
+                                  style: TextStyle(
+                                    color: Colors.green,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    trailing: const Icon(
+                      Icons.keyboard_arrow_right,
+                      color: Colors.grey,
+                      size: 24,
+                    ),
+                    onTap: () => _showFileOptions(file),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
     );
   }
-}
 
-// PDF View Page
-class PDFViewPage extends StatelessWidget {
-  final String filePath;
-  final String? password;
-
-  const PDFViewPage({Key? key, required this.filePath, this.password})
-      : super(key: key);
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('PDF Viewer'),
-        backgroundColor: Colors.grey[100],
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.black),
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
+  void _showFileOptions(Map<String, dynamic> file) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              file['name'],
+              style: const TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 20),
+            ListTile(
+              leading: const Icon(Icons.info_outline, color: Color(0xFFFFC700)),
+              title: const Text('View Details'),
+              onTap: () {
+                Navigator.pop(context);
+                _showFileDetails(file);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.open_in_new, color: Color(0xFFFFC700)),
+              title: const Text('Open File'),
+              onTap: () {
+                Navigator.pop(context);
+                _openFile(file);
+              },
+            ),
+            ListTile(
+              leading: Icon(
+                _isAnalyzing ? Icons.hourglass_empty : Icons.analytics,
+                color: _isAnalyzing ? Colors.grey : const Color(0xFFFFC700),
+              ),
+              title: Text(_isAnalyzing ? 'Analyzing...' : 'Analyze'),
+              onTap: _isAnalyzing
+                  ? null
+                  : () {
+                Navigator.pop(context);
+                _analyzeFile(file);
+              },
+            ),
+            if (file['analysisResult'] != null)
+              ListTile(
+                leading: const Icon(Icons.assessment, color: Color(0xFFFFC700)),
+                title: const Text('View Analysis'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showAnalysisResult(file['analysisResult']);
+                },
+              ),
+            const Divider(),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Colors.red),
+              title: const Text(
+                'Delete',
+                style: TextStyle(color: Colors.red),
+              ),
+              onTap: () {
+                Navigator.pop(context);
+                _showDeleteConfirmation(file);
+              },
+            ),
+            const SizedBox(height: 20),
+          ],
         ),
       ),
-      body: PDFView(
-        filePath: filePath,
-        password: password, // Pass the password to the PDFView
-        enableSwipe: true,
-        swipeHorizontal: true,
-        autoSpacing: false,
-        pageFling: false,
-        pageSnap: true,
-        defaultPage: 0,
-        fitPolicy: FitPolicy.BOTH,
-        preventLinkNavigation: false,
-        onRender: (_pages) {
-          // PDF rendered
-        },
-        onError: (error) {
-          // Handle errors - especially password errors
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Error: $error'),
-              duration: const Duration(seconds: 5),
-            ),
-          );
-          // Go back if there's an error (likely wrong password)
-          Navigator.of(context).pop();
-        },
-        onPageError: (page, error) {
-          // Handle page errors
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Error on page $page: $error')),
-          );
-        },
-        onPageChanged: (int? page, int? total) {
-          // Page changed
-        },
-        onViewCreated: (PDFViewController pdfViewController) {
-          // PDF view created
-        },
-      ),
     );
   }
-}
 
-// Transaction Record model (same as in report_page.dart)
-class TransactionRecord {
-  final DateTime date;
-  final String status;
-  final String type;
-  final double amount;
-
-  TransactionRecord({
-    required this.date,
-    required this.status,
-    required this.type,
-    required this.amount,
-  });
-
-  // Convert to map for Firestore
-  Map<String, dynamic> toMap() {
-    return {
-      'date': Timestamp.fromDate(date),
-      'status': status,
-      'type': type,
-      'amount': amount,
-    };
+  void _showDeleteConfirmation(Map<String, dynamic> file) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Delete File'),
+        content: Text('Are you sure you want to delete "${file['name']}"?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await _deleteFile(file);
+            },
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
   }
 }
